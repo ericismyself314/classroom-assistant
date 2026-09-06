@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>课堂助手</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { background: #f6f8f7; font-family: "Microsoft YaHei", "Segoe UI", sans-serif; color: #1f2a24; }
+      #boot { min-height: 100%; display: grid; place-items: center; text-align: center; }
+      #boot-card { padding: 28px 34px; border: 1px solid #cfe6d8; border-radius: 14px; background: #fff; box-shadow: 0 5px 20px rgba(31, 42, 36, .08); }
+      #boot-title { color: #2e7d4f; font-size: 19px; font-weight: 700; }
+      #boot-detail { margin-top: 8px; color: #54625a; font-size: 13px; }
+      #boot-error { margin-top: 14px; color: #a33a2e; font-size: 13px; white-space: pre-wrap; }
+      #boot-reload { display: none; margin-top: 16px; padding: 7px 14px; border: 1px solid #2e7d4f; border-radius: 8px; background: #2e7d4f; color: #fff; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="boot" role="status" aria-live="polite">
+        <div id="boot-card">
+          <div id="boot-title">课堂助手正在启动</div>
+          <div id="boot-detail">正在加载本地界面，请稍候…</div>
+          <div id="boot-error"></div>
+          <button id="boot-reload" type="button" onclick="location.reload()">重新加载</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      (() => {
+        const detail = document.getElementById('boot-detail');
+        const error = document.getElementById('boot-error');
+        const reload = document.getElementById('boot-reload');
+        const showError = (message) => {
+          if (!document.getElementById('boot')) return;
+          if (detail) detail.textContent = '本地界面没有正常加载。';
+          if (error) error.textContent = message || '请点击“重新加载”再试一次。';
+          if (reload) reload.style.display = 'inline-block';
+        };
+        window.addEventListener('error', (event) => {
+          if (event.target && event.target !== window) showError('界面脚本或样式文件读取失败。');
+          else if (event.message) showError(event.message);
+        });
+        window.addEventListener('unhandledrejection', () => showError('界面运行时发生异常。'));
+        window.setTimeout(() => {
+          if (document.getElementById('boot') && detail) detail.textContent = '本地服务正在响应，首次打开可能需要几秒…';
+        }, 3000);
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

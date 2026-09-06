@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">课堂助手功能流程示意图</title>
+  <desc id="desc">课堂录音或文字稿经过本地转写和中文整理，输出课堂概览、重要事项和可搜索原文。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#f5fbf7"/>
+      <stop offset="1" stop-color="#eef4ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#16352b" flood-opacity=".10"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#4f7c68"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="620" rx="32" fill="url(#bg)"/>
+  <text x="72" y="76" fill="#16352b" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="34" font-weight="700">课堂助手</text>
+  <text x="72" y="116" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="20">把一节课，整理成之后找得到、看得懂的内容</text>
+
+  <g filter="url(#shadow)">
+    <rect x="72" y="190" width="290" height="250" rx="24" fill="#ffffff"/>
+    <rect x="455" y="190" width="290" height="250" rx="24" fill="#ffffff"/>
+    <rect x="838" y="190" width="290" height="250" rx="24" fill="#ffffff"/>
+  </g>
+
+  <circle cx="132" cy="252" r="34" fill="#e2f3e7"/>
+  <text x="132" y="263" text-anchor="middle" fill="#347858" font-size="28">🎙</text>
+  <text x="96" y="332" fill="#16352b" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24" font-weight="700">输入课堂内容</text>
+  <text x="96" y="372" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">上传录音，或导入已有转写</text>
+  <text x="96" y="405" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">支持带时间戳的文字稿</text>
+
+  <circle cx="515" cy="252" r="34" fill="#e7efff"/>
+  <text x="515" y="263" text-anchor="middle" fill="#4167a5" font-size="28">✦</text>
+  <text x="479" y="332" fill="#16352b" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24" font-weight="700">本地处理</text>
+  <text x="479" y="372" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">语音识别、中文展示稿</text>
+  <text x="479" y="405" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">默认不离开你的电脑</text>
+
+  <circle cx="898" cy="252" r="34" fill="#fff2d8"/>
+  <text x="898" y="263" text-anchor="middle" fill="#a3721c" font-size="28">✓</text>
+  <text x="862" y="332" fill="#16352b" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24" font-weight="700">得到可跟进结果</text>
+  <text x="862" y="372" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">课堂概览、重要事项</text>
+  <text x="862" y="405" fill="#5f7169" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">原文证据、搜索与回听</text>
+
+  <path d="M370 315 H438" stroke="#4f7c68" stroke-width="5" stroke-linecap="round" marker-end="url(#arrow)"/>
+  <path d="M753 315 H821" stroke="#4f7c68" stroke-width="5" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <rect x="72" y="510" width="1056" height="58" rx="16" fill="#ffffff" opacity=".75"/>
+  <text x="600" y="547" text-anchor="middle" fill="#4e665b" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="17">默认离线优先 · 可修改 · 不确定内容单独标记 · 重要结论请回听核对</text>
+</svg>

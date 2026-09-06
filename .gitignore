@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Local build output
+build/
+dist/
+dist_old_*/
+installer/*.exe
+RELEASE_REPORT.md
+*.log
+
+# Local application data and model files
+data/
+models/
+audio/
+transcripts/
+exports/
+*.db
+*.db-*
+app_root.json
+
+# Local editor / OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
