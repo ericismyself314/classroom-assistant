@@ -56,10 +56,21 @@ def parse_relative_date(text: str, base: date) -> str | None:
         return None
     t = text.strip()
 
+    # Match a complete year first; never read a suffix of YYYY-MM-DD as M-D.
+    full = re.search(r"(?<!\d)(\d{4})(?:\s*年\s*|[-/])(\d{1,2})(?:\s*月\s*|[-/])(\d{1,2})(?:日|号)?(?!\d)", t)
+    if full:
+        try:
+            return date(*(int(part) for part in full.groups())).isoformat()
+        except ValueError:
+            return None
+    # A year qualifier without a complete date is ambiguous; preserve the raw text.
+    if re.search(r"明年|后年|去年|今年|\d{4}\s*年", t):
+        return None
+
     # 1) 阿拉伯数字：M月D日 / M/D
     m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?", t)
     if not m:
-        m = re.search(r"(\d{1,2})\s*[/\-]\s*(\d{1,2})", t)
+        m = re.search(r"(?<![\d/\-])(\d{1,2})\s*[/\-]\s*(\d{1,2})(?![\d/\-])", t)
     if m:
         d = _valid(int(m.group(1)), int(m.group(2)), base)
         return d.isoformat() if d else None
@@ -79,31 +90,26 @@ def parse_relative_date(text: str, base: date) -> str | None:
     wmap = {
         "一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6,
     }
-    wd = None
-    for key, val in wmap.items():
-        if re.search(r"周" + key + r"\b", t) or re.search(r"星期" + key, t) or re.search(r"礼拜" + key, t):
-            wd = val
-            break
-    if wd is None:
-        for key, val in wmap.items():
-            if key in t and ("周" in t or "星期" in t or "礼拜" in t):
-                wd = val
-                break
+    # Keep the weekday attached to its week token. In “下周五交第一章”,
+    # the unrelated 一 must not turn Friday into Monday.
+    week = re.search(r"(?P<offset>下下个?|下个?|本|这)?(?:周|星期|礼拜)(?P<day>[一二三四五六日天])", t)
+    wd = wmap[week.group('day')] if week else None
 
     if wd is not None:
         mon = base - timedelta(days=base.weekday())
         this_week = mon + timedelta(days=wd)
         # 偏移
-        if "下下周" in t or "下下个周" in t:
+        offset = week.group('offset') or ''
+        if offset.startswith('下下'):
             return (this_week + timedelta(weeks=2)).isoformat()
-        if "下周" in t or "下个周" in t or "下星期" in t or "下礼拜" in t:
+        if offset.startswith('下'):
             target = this_week + timedelta(weeks=1)
-        elif "本周" in t or "这周" in t or "这星期" in t or "本周" in t:
+        elif offset in ('本', '这'):
             target = this_week
         else:
             # 仅「周X/星期五」：默认本周；若已过去则取本周（保持原话语义）
             target = this_week
-        if target < base and ("下周" not in t and "下个周" not in t and "下星期" not in t and "下礼拜" not in t):
+        if target < base and not offset.startswith('下'):
             # 已过且非明确「下周」：保守返回 None，避免误判到下周
             return None
         return target.isoformat()

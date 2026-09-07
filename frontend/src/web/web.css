@@ -1,0 +1,253 @@
+.web-app {
+  max-width: 1280px;
+  margin: auto;
+  padding: 40px 32px;
+  color: #21382f;
+}
+.web-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+.web-header h1 {
+  font-size: 38px;
+  letter-spacing: -1px;
+  margin: 10px 0;
+}
+.web-header p {
+  color: #63766d;
+}
+.web-header a {
+  color: #28604a;
+  white-space: nowrap;
+}
+.web-eyebrow {
+  font-size: 12px;
+  letter-spacing: 2px;
+  color: #587667;
+}
+.web-notice {
+  background: #eaf1eb;
+  border: 1px solid #d3e1d6;
+  border-radius: 10px;
+  padding: 16px;
+  line-height: 1.7;
+  font-size: 13px;
+  margin-bottom: 24px;
+}
+.web-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.web-library,
+.web-editor {
+  background: white;
+  border: 1px solid #dce4de;
+  border-radius: 14px;
+  padding: 24px;
+  min-width: 0;
+}
+.web-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.web-section-title h2 {
+  font-size: 19px;
+  margin: 0 0 16px;
+}
+.web-section-title small {
+  font-size: 13px;
+  color: #718377;
+}
+.web-app label {
+  display: block;
+  font-size: 13px;
+  color: #42594d;
+  margin: 14px 0;
+}
+.web-app input,
+.web-app textarea,
+.web-app select {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.web-app input[type="file"] {
+  font-size: 12px;
+}
+.web-app button {
+  white-space: normal;
+  min-height: 36px;
+}
+.web-app button.primary {
+  background: #28604a;
+  border-color: #28604a;
+}
+.web-app button:focus-visible,
+.web-app a:focus-visible,
+.web-app summary:focus-visible {
+  outline: 3px solid #6aab8b;
+  outline-offset: 3px;
+}
+.web-records {
+  max-height: 520px;
+  overflow: auto;
+  margin: 18px 0;
+}
+.web-record {
+  display: block;
+  text-align: left;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 14px;
+  background: #f7f9f6;
+  border: 1px solid transparent;
+}
+.web-record.selected {
+  border-color: #659a7a;
+  background: #eaf3eb;
+}
+.web-record span,
+.web-record small,
+.web-record strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.web-record span,
+.web-record small {
+  font-size: 12px;
+  color: #63766d;
+}
+.web-record strong {
+  font-size: 15px;
+  margin: 8px 0;
+}
+.web-muted,
+.web-backup p {
+  font-size: 13px;
+  color: #667b70;
+  line-height: 1.7;
+}
+.web-backup {
+  border-top: 1px solid #e2e9e2;
+  padding-top: 12px;
+}
+.web-fields {
+  display: grid;
+  grid-template-columns: 1fr 180px;
+  gap: 20px;
+}
+.web-editor fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.web-editor section {
+  border-top: 1px solid #e1e8e2;
+  padding: 16px 0;
+  margin-top: 18px;
+}
+.web-editor h3 {
+  font-size: 15px;
+}
+.web-editor audio {
+  width: 100%;
+  display: block;
+  margin: 12px 0;
+}
+.web-editor details {
+  margin-top: 16px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.web-editor summary {
+  cursor: pointer;
+  color: #28604a;
+}
+.web-editor textarea {
+  line-height: 1.8;
+  resize: vertical;
+}
+.web-timeline {
+  max-height: 380px;
+  overflow: auto;
+}
+.web-timeline p {
+  display: flex;
+  gap: 14px;
+  align-items: start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.web-timeline button {
+  flex-shrink: 0;
+}
+.web-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.web-status {
+  color: #28604a;
+  min-height: 24px;
+  line-height: 1.7;
+}
+.web-error {
+  background: #fff0ed;
+  color: #9b332d;
+  border: 1px solid #eebdb5;
+  padding: 16px;
+  margin: 16px 0;
+  overflow-wrap: anywhere;
+}
+.web-footer {
+  padding: 24px 0;
+  color: #718377;
+  font-size: 12px;
+  line-height: 1.7;
+}
+@media (max-width: 760px) {
+  .web-app {
+    padding: 22px 14px;
+  }
+  .web-header {
+    align-items: flex-start;
+  }
+  .web-header h1 {
+    font-size: 28px;
+  }
+  .web-header a {
+    font-size: 12px;
+  }
+  .web-layout {
+    grid-template-columns: 1fr;
+  }
+  .web-library,
+  .web-editor {
+    padding: 18px;
+  }
+  .web-records {
+    max-height: 220px;
+  }
+  .web-fields {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .web-header p {
+    line-height: 1.6;
+  }
+  .web-eyebrow {
+    font-size: 10px;
+    letter-spacing: 1px;
+  }
+}

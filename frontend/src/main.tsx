@@ -1,11 +1,17 @@
-import React from 'react';
-import { createRoot } from 'react-dom/client';
-import App from './App';
-import './styles.css';
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { lazy, Suspense } from "react";
+const App = lazy(() =>
+  import.meta.env.MODE === "pages" ? import("./web/PagesApp") : import("./App"),
+);
+import "./styles.css";
 
 type BoundaryState = { error: Error | null };
 
-class AppErrorBoundary extends React.Component<React.PropsWithChildren, BoundaryState> {
+class AppErrorBoundary extends React.Component<
+  React.PropsWithChildren,
+  BoundaryState
+> {
   state: BoundaryState = { error: null };
 
   static getDerivedStateFromError(error: Error): BoundaryState {
@@ -13,7 +19,7 @@ class AppErrorBoundary extends React.Component<React.PropsWithChildren, Boundary
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    console.error('课堂助手界面渲染失败', error, info.componentStack);
+    console.error("课堂助手界面渲染失败", error, info.componentStack);
   }
 
   render() {
@@ -21,8 +27,10 @@ class AppErrorBoundary extends React.Component<React.PropsWithChildren, Boundary
       return (
         <div className="boot-error-page">
           <h2>课堂助手界面加载失败</h2>
-          <p>本地服务仍在运行，但页面组件遇到异常。</p>
-          <button className="primary" onClick={() => window.location.reload()}>重新加载页面</button>
+          <p>页面组件遇到异常，请重新加载。已保存的数据不会因此删除。</p>
+          <button className="primary" onClick={() => window.location.reload()}>
+            重新加载页面
+          </button>
         </div>
       );
     }
@@ -30,6 +38,10 @@ class AppErrorBoundary extends React.Component<React.PropsWithChildren, Boundary
   }
 }
 
-createRoot(document.getElementById('root')!).render(
-  <AppErrorBoundary><App /></AppErrorBoundary>,
+createRoot(document.getElementById("root")!).render(
+  <AppErrorBoundary>
+    <Suspense fallback={<div className="empty">正在加载…</div>}>
+      <App />
+    </Suspense>
+  </AppErrorBoundary>,
 );
