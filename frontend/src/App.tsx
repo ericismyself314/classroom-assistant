@@ -27,13 +27,17 @@ const NAV = [
 export default function App() {
   const [view, setView] = useState<View>({ name: 'week' });
   const [hasSemester, setHasSemester] = useState<boolean | null>(null);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
-    api.state().then((s) => setHasSemester(s.has_semester)).catch(() => setHasSemester(false));
+    api.state().then((s) => setHasSemester(s.has_semester)).catch((e) => setLoadError(e.message));
   }, []);
 
   const navigate = (v: View) => setView(v);
 
+  if (loadError) {
+    return <div className="empty" role="alert"><p>{loadError}</p><button onClick={() => window.location.reload()}>重新连接</button></div>;
+  }
   if (hasSemester === null) {
     return <div className="empty">正在加载…</div>;
   }

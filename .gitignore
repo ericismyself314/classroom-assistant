@@ -9,6 +9,9 @@ venv/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+frontend/dist-pages/
+frontend/test-results/
+frontend/playwright-report/
 *.tsbuildinfo
 
 # Local build output
