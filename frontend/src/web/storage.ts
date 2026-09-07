@@ -133,7 +133,12 @@ export async function importLessons(file: File): Promise<number> {
     };
     tx.onabort = tx.onerror = () => {
       db.close();
-      reject(tx.error);
+      reject(
+        tx.error ||
+          new Error(
+            "文字备份导入失败，未导入任何记录。请检查浏览器可用空间后重试。",
+          ),
+      );
     };
   });
   return records.length;

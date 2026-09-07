@@ -1,4 +1,8 @@
-import { pipeline, env } from "@huggingface/transformers";
+import {
+  pipeline,
+  env,
+  type AutomaticSpeechRecognitionPipeline,
+} from "@huggingface/transformers";
 
 env.allowLocalModels = false;
 // GitHub Pages cannot supply COOP/COEP headers; avoid shared-memory WASM threads.
@@ -6,8 +10,11 @@ if (env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = 1;
 self.onmessage = async ({
   data,
 }: MessageEvent<{ audio: Float32Array; language: string }>) => {
+  let recognizer: AutomaticSpeechRecognitionPipeline | undefined;
+  let response:
+    { type: "complete"; result: unknown } | { type: "error"; message: string };
   try {
-    const recognizer = await pipeline(
+    recognizer = await pipeline<"automatic-speech-recognition">(
       "automatic-speech-recognition",
       "Xenova/whisper-tiny",
       {
@@ -32,12 +39,21 @@ self.onmessage = async ({
       task: "transcribe",
       ...(data.language === "auto" ? {} : { language: data.language }),
     });
-    self.postMessage({ type: "complete", result });
-    await recognizer.dispose();
+    response = { type: "complete", result };
   } catch (error) {
-    self.postMessage({
+    response = {
       type: "error",
       message: error instanceof Error ? error.message : String(error),
-    });
+    };
+  } finally {
+    // The UI terminates the worker on its terminal message. Release first so
+    // success and inference failures both get a chance to clean up explicitly.
+    try {
+      await recognizer?.dispose();
+    } catch (error) {
+      // Cleanup failure must not hide a transcript or the original ASR error.
+      console.warn("语音模型资源释放失败；主界面将终止 Worker。", error);
+    }
   }
+  self.postMessage(response);
 };

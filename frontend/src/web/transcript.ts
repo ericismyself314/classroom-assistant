@@ -1,6 +1,9 @@
 export function timestamp(seconds: number): string {
   const value = Math.max(0, Math.floor(seconds));
-  return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+  const secondsPart = String(value % 60).padStart(2, "0");
+  if (value < 3600)
+    return `${String(Math.floor(value / 60)).padStart(2, "0")}:${secondsPart}`;
+  return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor(value / 60) % 60).padStart(2, "0")}:${secondsPart}`;
 }
 export function timeline(
   text: string,
@@ -19,7 +22,7 @@ export function timeline(
 export function extractNotes(text: string): string {
   const lines = timeline(text);
   const important = lines.filter((line) =>
-      /作业|作業|考试|考試|截止|提交|assignment|homework|submit|quiz|exam|deadline|due\b/i.test(
+    /作业|作業|考试|考試|截止|提交|assignment|homework|submit|quiz|exam|deadline|due\b/i.test(
       line.text,
     ),
   );
