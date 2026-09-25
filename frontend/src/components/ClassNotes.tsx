@@ -1,5 +1,6 @@
 import { ReactNode, useState } from 'react';
 import { Segment } from '../types';
+import { chineseEvidence, displaySummary, displayText, displayTitle, hasChinese } from '../chineseDisplay';
 
 const KINDS: Record<string, string> = { concept: '知识点', example: '课堂例子', formula: '公式与推导', caution: '注意点' };
 const time = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
@@ -22,21 +23,32 @@ function compactLegacy(rows: any[], limit = 5): any[] {
   });
 }
 
-export function Sources({ evidence, onSeek }: { evidence: any[]; onSeek: (s: number) => void }) {
+export function Sources({ evidence, onSeek, segments = [] }: { evidence: any[]; onSeek: (s: number) => void; segments?: Segment[] }) {
   if (!evidence?.length) return null;
   return <details className="note-sources"><summary>查看中文转写与出处 · {evidence.length} 段</summary>
     {evidence.map((e, i) => <blockquote key={i}>
       {e.start_seconds != null && <button className="source-time" onClick={() => onSeek(e.start_seconds)}>▶ {time(e.start_seconds)}</button>}
-      <span>{e.quote}</span>
+      <span>{displayText(e.quote, chineseEvidence(e, segments))}</span>
     </blockquote>)}
   </details>;
 }
 
-export function ClassNotes({ notes, onSeek, processing, onEdit, beforeKnowledge }: { notes: any; onSeek: (s: number) => void; processing: boolean; onEdit?: (index: number) => void; beforeKnowledge?: ReactNode }) {
+export function ClassNotes({ notes, segments = [], onSeek, processing, onEdit, beforeKnowledge }: { notes: any; segments?: Segment[]; onSeek: (s: number) => void; processing: boolean; onEdit?: (index: number) => void; beforeKnowledge?: ReactNode }) {
   const rawChapters: any[] = notes?.knowledge || notes?.chapters || [];
-  const chapters: any[] = notes?.version >= 3 ? rawChapters : compactLegacy(rawChapters);
-  const timeline: any[] = notes?.timeline || chapters;
-  const title = notes?.title || notes?.overview_title || '';
+  const legacy: any[] = notes?.version >= 3 ? rawChapters : compactLegacy(rawChapters);
+  const normalize = (row: any, parentEvidence = '') => {
+    const evidence = chineseEvidence(row, segments) || parentEvidence;
+    const title = displayTitle(row?.title, evidence || row?.summary);
+    const summary = displaySummary(row?.summary, evidence);
+    const points = (Array.isArray(row?.points) ? row.points : []).map((point: any) => {
+      const raw = typeof point === 'string' ? { text: point } : point || {};
+      return { ...raw, text: displayText(raw.text, evidence) };
+    });
+    return { ...row, title, summary, points, _chineseEvidence: evidence };
+  };
+  const chapters: any[] = legacy.map((row) => normalize(row));
+  const timeline: any[] = (notes?.timeline || chapters).map((row: any) => normalize(row, chineseEvidence(row, segments)));
+  const title = displayTitle(notes?.title || notes?.overview_title, chapters[0]?._chineseEvidence || '');
   const canEdit = !!onEdit && notes?.version >= 3;
   return <>
     <section className="notes-overview" aria-label="课堂概览">
@@ -64,10 +76,10 @@ export function ClassNotes({ notes, onSeek, processing, onEdit, beforeKnowledge 
         {c.important && <span className="badge important">重点</span>}
         {c.manual_edit && <span className="badge">已手动修改 · 原话可供回听核对</span>}
         <p className="chapter-summary">{c.summary}</p>
-        <Sources evidence={c.evidence} onSeek={onSeek} />
+        <Sources evidence={c.evidence} onSeek={onSeek} segments={segments} />
         {c.points?.map((p: any, j: number) => <div className={`note-point ${p.important ? 'important-point' : ''}`} key={j}>
           <div className="row" style={{ justifyContent: 'space-between' }}><span className="note-kind">{KINDS[p.kind] || '知识点'}</span>{p.important && <span className="badge important">重点</span>}</div><p>{typeof p === 'string' ? p : p.text}</p>
-          <Sources evidence={p.evidence} onSeek={onSeek} />
+          <Sources evidence={p.evidence} onSeek={onSeek} segments={segments} />
         </div>)}
       </div>
     </article>)}
@@ -83,15 +95,15 @@ export function ReviewNotes({ notes, segments, onSeek }: { notes: any; segments:
       {notes.coverage.pending_passages ? `其中 ${notes.coverage.pending_passages} 处仍需核对。` : '本轮未留下未决的查漏片段。'} 此检查不能保证没有遗漏。</p>}
     {!review.length && !uncertain.length && <p className="small muted">暂无单独标出的存疑片段。不代表转写完全准确，重要细节仍应回听。</p>}
     {review.map((r, i) => <details key={i} className="review-entry">
-      <summary>{r.title} <span className="badge warn">待核对</span></summary>
-      <p className="small muted">{r.reason}。以下是待核对草稿，不是确定结论。</p><p>{r.summary}</p>
-      <Sources evidence={r.evidence} onSeek={onSeek} />
+      <summary>{displayTitle(r.title, chineseEvidence(r, segments))} <span className="badge warn">待核对</span></summary>
+      <p className="small muted">{displayText(r.reason, chineseEvidence(r, segments))}。以下是待核对草稿，不是确定结论。</p><p>{displayText(r.summary, chineseEvidence(r, segments))}</p>
+      <Sources evidence={r.evidence} onSeek={onSeek} segments={segments} />
     </details>)}
     {!!notes?.rejected_count && <p className="small muted">另有 {notes.rejected_count} 条候选缺少有效原文证据，未收录进笔记。</p>}
     {!!uncertain.length && <details><summary>听辨存疑的原文 · {uncertain.length} 段</summary>
       <p className="small muted">这些是识别器标记的不确定片段，并非全部错误。可点击时间回听。</p>
       {(showAll ? uncertain : uncertain.slice(0, 12)).map(s => <div className="review-entry" key={s.id}>
-        {s.start_seconds != null && <button className="source-time" onClick={() => onSeek(s.start_seconds!)}>▶ {time(s.start_seconds)}</button>} {s.display_text || '中文展示稿尚未生成，请重新分析。'}
+        {s.start_seconds != null && <button className="source-time" onClick={() => onSeek(s.start_seconds!)}>▶ {time(s.start_seconds)}</button>} {displayText(s.display_text, hasChinese(s.text) ? s.text : '')}
       </div>)}
       {uncertain.length > 12 && <button className="ghost" onClick={() => setShowAll(!showAll)}>{showAll ? '收起' : `查看全部 ${uncertain.length} 段`}</button>}
     </details>}

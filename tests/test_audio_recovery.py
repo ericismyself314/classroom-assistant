@@ -1,5 +1,4 @@
 """Focused audio recovery regressions; no models, network, or real app DB used."""
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,15 +10,65 @@ from backend.ai import whisper_worker as worker
 from backend.ai import segment_analysis
 
 
-def test_partial_cuda_runtime_is_not_ready():
-    def load(name):
-        if "cudnn" in name:
-            raise OSError("missing cuDNN")
-        return object()
-    with patch.object(worker, "_cuda_ready", None), \
-         patch.object(worker, "_register_nvidia_dll_dirs"), \
-         patch.object(worker.ctypes, "WinDLL", side_effect=load, create=True):
-        assert worker.cuda_runtime_ready() is False
+def test_qwen_gpu_failure_restarts_worker_in_cpu_mode():
+    class Process:
+        def poll(self):
+            return None
+
+    class Worker:
+        def __init__(self, device):
+            self.device = device
+            self.process = Process()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    gpu_worker = Worker("cuda")
+    cpu_worker = Worker("cpu")
+    with patch.object(worker, "_qwen_external_worker", gpu_worker), \
+         patch.object(worker, "_start_qwen_external_worker", return_value=cpu_worker) as start:
+        assert worker._get_qwen_model("cpu") is cpu_worker
+    assert gpu_worker.closed
+    start.assert_called_once_with("cpu")
+
+
+def test_gpu_probe_uses_qwen_pytorch_runtime():
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 2))
+    with patch.object(worker.sys, "frozen", False, create=True), \
+         patch("importlib.import_module", return_value=torch):
+        info = worker.gpu_info()
+    assert info["usable"] is True and info["count"] == 2
+    assert info["name"] == "NVIDIA GPU（PyTorch CUDA）"
+
+
+def test_cleanup_removes_only_partial_qwen_model(tmp_path):
+    speech_root = tmp_path / "speech"
+    model_dir = speech_root / "Qwen3-ASR-0.6B"
+    model_dir.mkdir(parents=True)
+    (model_dir / "partial.bin").write_bytes(b"partial")
+    other_model = speech_root / "another-model"
+    other_model.mkdir()
+    marker = other_model / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    config = SimpleNamespace(dirs=SimpleNamespace(speech_models=str(speech_root)))
+
+    with patch.object(worker, "get_config", return_value=config), \
+         patch.object(worker, "validate_qwen_model_installation", return_value={"ok": False}):
+        result = worker.cleanup_broken_model("Qwen3-ASR-0.6B")
+    assert result["removed"] == [str(model_dir)]
+    assert not model_dir.exists() and marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_cleanup_does_not_remove_complete_or_unsupported_model(tmp_path):
+    with patch.object(worker, "validate_qwen_model_installation", return_value={"ok": True}):
+        result = worker.cleanup_broken_model("Qwen3-ASR-0.6B")
+    assert result == {"size": "Qwen3-ASR-0.6B", "removed": [], "now_downloaded": True}
+    try:
+        worker.cleanup_broken_model("small")
+        assert False, "其他语音模型不应进入清理路径"
+    except ValueError as exc:
+        assert "Qwen3-ASR-0.6B" in str(exc)
 
 
 def test_retry_marks_session_processing_before_thread_start():
@@ -32,71 +81,6 @@ def test_retry_marks_session_processing_before_thread_start():
         thread.return_value.start.side_effect = lambda: events.append("started")
         assert api.start_pipeline("session", "transcribe") == ("job", None)
         assert events == [{"status": "file_check", "processing_error": None}, "started"]
-
-
-def test_gpu_failure_retries_cpu_and_uses_validated_local_snapshot():
-    calls = []
-    retries = []
-
-    class Model:
-        def __init__(self, path, **kwargs):
-            calls.append((path, kwargs))
-            self.device = kwargs["device"]
-
-        def transcribe(self, *args, **kwargs):
-            if self.device == "cuda":
-                raise RuntimeError("Library cublas64_12.dll is not found")
-            segment = SimpleNamespace(start=1, end=2, text="本地识别", no_speech_prob=0, avg_logprob=0)
-            return iter([segment]), SimpleNamespace(language="zh")
-
-    with patch.object(worker, "resolve_device", return_value={"device": "cuda", "used_cuda": True}), \
-         patch.object(worker, "validate_model_installation", return_value={"ok": True, "model_path": "verified-snapshot"}), \
-         patch.object(worker, "_cache_dir", return_value="unused-cache"), \
-         patch.object(worker, "models_root", return_value="unused-models"), \
-         patch.object(worker, "_cuda_ready", None), \
-         patch.dict(os.environ, {}), \
-         patch("faster_whisper.WhisperModel", Model):
-        segments, language, device = worker.transcribe("unused-audio", on_retry=lambda *a: retries.append(a))
-    assert device == "cpu" and language == "zh" and segments[0]["text"] == "本地识别"
-    assert len(retries) == 1 and len(calls) == 2
-    assert all(p == "verified-snapshot" and kw["local_files_only"] for p, kw in calls)
-    assert calls[1][1]["compute_type"] == "int8"
-
-
-def test_empty_audio_is_not_reported_as_success():
-    class Model:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def transcribe(self, *args, **kwargs):
-            return iter([]), SimpleNamespace(language="zh")
-
-    with patch.object(worker, "resolve_device", return_value={"device": "cpu", "used_cuda": False}), \
-         patch.object(worker, "validate_model_installation", return_value={"ok": True, "model_path": "verified"}), \
-         patch.object(worker, "_cache_dir", return_value="unused-cache"), \
-         patch.object(worker, "models_root", return_value="unused-models"), \
-         patch.dict(os.environ, {}), \
-         patch("faster_whisper.WhisperModel", Model):
-        try:
-            worker.transcribe("unused-audio")
-        except ValueError as error:
-            assert "没有识别到清晰的人声" in str(error)
-        else:
-            raise AssertionError("Empty audio was accepted")
-
-
-def test_validator_tries_legacy_after_broken_current():
-    with patch.object(worker, "models_root", return_value="current"), \
-         patch.object(worker, "_cache_dir", return_value="legacy"), \
-         patch.object(worker.os.path, "isdir", return_value=True), \
-         patch.object(worker.os.path, "isfile", return_value=False), \
-         patch.object(worker.os, "listdir", return_value=["snapshot"]), \
-         patch.object(worker.os.path, "getmtime", return_value=1), \
-         patch("builtins.open", side_effect=FileNotFoundError), \
-         patch.object(worker, "_validate_model_snapshot", side_effect=[
-             {"ok": False, "reason": "blob_truncated"},
-             {"ok": True, "model_path": "legacy-valid"}]):
-        assert worker.validate_model_installation("small")["model_path"] == "legacy-valid"
 
 
 def test_analysis_formats_prompt_and_recovers_invalid_json():

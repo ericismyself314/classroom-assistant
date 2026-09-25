@@ -16,8 +16,12 @@ export interface Session {
   end_time: string | null; week_number: number | null; title: string | null;
   location: string | null; status: string; source_type: string | null;
   audio_path: string | null; audio_hash: string | null; audio_duration_seconds: number | null;
+  audio_manifest?: string | null;
   transcript_language: string | null; transcription_model: string | null;
   analysis_model: string | null; processing_error: string | null;
+}
+export interface AudioFile {
+  index: number; name: string; bytes: number | null; duration: number | null;
 }
 export interface Segment {
   id: string; session_id: string; sequence_number: number;

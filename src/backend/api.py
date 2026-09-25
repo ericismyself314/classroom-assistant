@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import shutil
+import subprocess
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,7 +86,6 @@ def _send_json(handler, obj, status=200):
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
@@ -108,6 +108,7 @@ def _read_body(handler):
 # 上传单文件最大 2 GiB。一次性读进内存对 100MB+ 的录音足够，但 4K 课堂
 # 录像 / 超长录音的极端场景会被 OOM，所以这里统一走流式落盘。
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_BATCH_FILES = 64
 _CHUNK = 1024 * 1024
 
 
@@ -157,6 +158,14 @@ def _stream_to_file(handler, dest: str) -> tuple[int, str]:
             f.write(buf)
             sha.update(buf)
     return written, sha.hexdigest()
+
+
+def _audio_collection_hash(files: list[dict]) -> str:
+    """Stable hash for an ordered collection of uploaded audio files."""
+    if len(files) == 1 and files[0].get("hash"):
+        return files[0]["hash"]
+    payload = json.dumps([f.get("hash") for f in files], separators=(",", ":"))
+    return hashutil.sha256_bytes(payload.encode("utf-8"))
 
 
 def _read_json(handler):
@@ -395,11 +404,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             return _send_json(self, {"job": dict(job) if job else None})
 
         # 上传录音（裸字节）
-        m = re.match(r"/api/sessions/([\w-]+)/audio$", p)
-        if m and method == "POST":
+        m = re.match(r"/api/sessions/([\w-]+)/audio(?:/(\d+))?$", p)
+        if m and method == "POST" and m.group(2) is None:
             return self._upload_audio(m.group(1))
+        if m and method == "DELETE":
+            if m.group(2) is None:
+                return self._delete_session_audio(m.group(1))
+            return self._delete_staged_audio_file(m.group(1), int(m.group(2)))
         if m and method == "GET":
-            return self._serve_session_audio(m.group(1))
+            return self._serve_session_audio(m.group(1), int(m.group(2) or 0))
 
         # 导入文字
         m = re.match(r"/api/sessions/([\w-]+)/transcript$", p)
@@ -412,7 +425,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             b = _read_json(self)
             mode = (b.get("mode") or "transcribe").lower()
             need_whisper = ("transcrib" in mode) or ("full" in mode)
-            need_llm = ("analy" in mode) or ("full" in mode)
+            need_llm = ("analy" in mode) or ("full" in mode) or mode in {"transcribe", "retranscribe"}
             if not need_whisper and not need_llm:  # 未知模式，保守要求两者
                 need_whisper = need_llm = True
             settings = db.get_all_settings()
@@ -422,14 +435,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 v = whisper_worker.validate_model_installation(size)
                 if not v.get("ok"):
                     return _send_json(self, {
-                        "error": f"语音模型（{size}）{v.get('detail') or '缺失或不完整'}，请先到「设置 → 模型」处理。",
-                        "code": "model_missing" if v.get("reason") == "no_snapshot" else "model_broken",
+                        "error": f"语音模型（{size}）{v.get('detail') or '缺失或不完整'}，请先到设置页处理。",
+                        "code": "model_missing" if v.get("reason") in {"no_snapshot", "model_missing"} else "model_broken",
                         "validation": v,
                     }, status=409)
             if need_llm:
                 st = detect_status(settings)
                 if not provider_is_ready(settings, st):
-                    return _send_json(self, {"error": "请先在「设置 → 模型」中下载文字分析模型，再开始分析。"}, status=409)
+                    return _send_json(self, {"error": "请先在设置页下载文字整理模型，再开始分析。"}, status=409)
             job_id, err = start_pipeline(m.group(1), b.get("mode", "transcribe"),
                                          b.get("whisper_tier"), b.get("language"))
             if err:
@@ -571,6 +584,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         sem = db.get_active_semester()
         has_sem = sem is not None
         courses = db.list_courses(semester_id=sem["id"]) if has_sem else []
+        if self._qs_dict().get("brief") == "1":
+            return _send_json(self, {
+                "has_semester": has_sem,
+                "semester": sem,
+                "course_count": len(courses),
+            })
         from .ai import whisper_worker as ww
         s = db.get_all_settings()
         return _send_json(self, {
@@ -579,9 +598,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             "course_count": len(courses),
             "data_dir": config.get_config().dirs.data_dir,
             "disk": config.get_config().dirs.disk_usage(),
-            "gpu": ww.gpu_info(),
-            "whisper_resolved": ww.resolve_device(
-                (s.get("whisper_device") or "auto")),
+            # Keep dashboard/settings startup light; actual CUDA probing is
+            # deferred to Test or the first recording.
+            "gpu": ww.gpu_info(probe=False),
+            "whisper_resolved": {"device": "cpu" if (s.get("whisper_device") or "auto") == "cpu" else "auto",
+                                 "requested": s.get("whisper_device") or "auto",
+                                 "used_cuda": None, "reason": "处理时检测"},
             "whisper_downloaded": ww.is_model_downloaded(manifest.WHISPER_TIERS[manifest.DEFAULT_WHISPER_TIER]["model_size"]),
             "active_jobs": db.active_jobs(),
         })
@@ -591,12 +613,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not sess:
             return _send_json(self, {"error": "不存在"}, status=404)
         course = db.get_course(sess["course_id"]) or {}
+        audio_files = [
+            {k: f.get(k) for k in ("index", "name", "bytes", "duration")}
+            for f in db.audio_files_for_session(sess)
+        ]
         segments = db.list_segments(sid)
         topics = db.list_topics(sid)
         items = db.list_items({"course_id": sess["course_id"]})
         items = [i for i in items if i["session_id"] == sid]
         return _send_json(self, {
             "session": sess, "course": course,
+            "audio_files": audio_files,
             "segments": segments, "topics": topics, "items": items,
             "notes": json.loads(sess["notes_data"]) if sess.get("notes_data") else None,
             "revisions": db.list_revisions(sid),
@@ -608,7 +635,53 @@ class ApiHandler(BaseHTTPRequestHandler):
         sess = db.get_session(sid)
         if not sess:
             return _send_json(self, {"error": "不存在"}, status=404)
+
+        defer_processing = (self.headers.get("X-Defer-Processing", "") or "").lower() in {"1", "true", "yes"}
+
+        batch_header = (self.headers.get("X-Batch-Upload", "") or "").lower()
+        is_batch = batch_header in {"1", "true", "yes"}
+        batch_index = 0
+        batch_count = 1
+        batch_existing_count = None
+        if is_batch:
+            try:
+                batch_index = int(self.headers.get("X-Batch-Index", "-1"))
+                batch_count = int(self.headers.get("X-Batch-Count", "0"))
+            except ValueError:
+                return _send_json(self, {"error": "批量上传参数无效", "code": "bad_batch"}, status=400)
+            if batch_count < 1 or batch_count > _MAX_BATCH_FILES or not 0 <= batch_index < batch_count:
+                return _send_json(self, {
+                    "error": f"批量上传最多支持 {_MAX_BATCH_FILES} 个文件",
+                    "code": "bad_batch",
+                }, status=400)
+            current_files = db.audio_files_for_session(sess)
+            # 批量上传按选择顺序串行提交；保留课堂原有录音，并拒绝跳号，
+            # 避免多个批次混在同一节课里。新客户端会带上原有文件数，
+            # 旧客户端没有该头部时则按当前清单推断以保持兼容。
+            existing_header = self.headers.get("X-Batch-Existing-Count")
+            if existing_header not in (None, ""):
+                try:
+                    batch_existing_count = int(existing_header)
+                except ValueError:
+                    return _send_json(self, {"error": "批量上传原有文件数无效", "code": "bad_batch"}, status=400)
+                if batch_existing_count < 0 or batch_existing_count > len(current_files):
+                    return _send_json(self, {"error": "课堂录音清单已发生变化，请重新选择全部录音", "code": "batch_out_of_order"}, status=409)
+            else:
+                batch_existing_count = len(current_files) if batch_index == 0 else max(0, len(current_files) - batch_index)
+            if len(current_files) != batch_existing_count + batch_index:
+                return _send_json(self, {
+                    "error": "批量上传顺序已失效，请重新选择全部录音",
+                    "code": "batch_out_of_order",
+                }, status=409)
+
         filename = self.headers.get("X-Filename", "audio.m4a")
+        original_filename = self.headers.get("X-Original-Filename")
+        if original_filename:
+            try:
+                from urllib.parse import unquote
+                filename = unquote(original_filename).replace("\r", "").replace("\n", "")[:255] or filename
+            except Exception:  # noqa: BLE001
+                pass
         ext = os.path.splitext(filename)[1].lower() or ".m4a"
         if ext not in hashutil.SUPPORTED_AUDIO_EXT:
             return _send_json(self, {"error": f"不支持的格式：{ext}"}, status=400)
@@ -623,19 +696,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "error": f"文件过大：{declared_len} 字节（上限 {_MAX_UPLOAD_BYTES}）",
                 "code": "too_large",
             }, status=413)
-        # 上传前先确认语音模型已就绪（严格校验 snapshot 真实可用，
-        # 不只看 symlink size——避免「下载到一半断电」/「手动清理了 blobs」
-        # 等假阳性导致上传后转写再次失败）。
         settings = db.get_all_settings()
-        size = _resolve_whisper_size(settings.get("whisper_tier"), settings)
-        v = whisper_worker.validate_model_installation(size)
-        if not v.get("ok"):
-            detail = v.get("detail") or "模型文件缺失或不完整"
-            return _send_json(self, {
-                "error": f"语音模型（{size}）{detail}。请到「设置 → 模型」点击「重新校验 / 清理后重新下载」。",
-                "code": "model_missing" if v.get("reason") == "no_snapshot" else "model_broken",
-                "validation": v,
-            }, status=409)
+        if not defer_processing:
+            # 立即处理前核实语音模型快照与文字模型都可用；单纯暂存录音不依赖模型。
+            size = _resolve_whisper_size(settings.get("whisper_tier"), settings)
+            v = whisper_worker.validate_model_installation(size)
+            if not v.get("ok"):
+                detail = v.get("detail") or "模型文件缺失或不完整"
+                return _send_json(self, {
+                    "error": f"语音模型（{size}）{detail}。请到「设置 → 模型」点击「重新校验 / 清理后重新下载」，或先暂存录音。",
+                    "code": "model_missing" if v.get("reason") in {"no_snapshot", "model_missing"} else "model_broken",
+                    "validation": v,
+                }, status=409)
+            provider_status = detect_status(settings)
+            if not provider_is_ready(settings, provider_status):
+                return _send_json(self, {
+                    "error": "文字整理模型尚未就绪。请先到设置页完成模型准备，或选择先保存录音、稍后处理。",
+                    "code": "llm_missing",
+                }, status=409)
         # 复制到受管目录（流式落盘 + 边写边算 hash，避免 100MB+ 录音一次性进内存）
         sem = db.get_semester(db.get_course(sess["course_id"])["semester_id"])
         adir = config.get_config().dirs.audio_dir_for(sem["id"], sess["course_id"], sid)
@@ -656,14 +734,57 @@ class ApiHandler(BaseHTTPRequestHandler):
             os.remove(dest)
             return _send_json(self, {"error": "音频文件已损坏，无法解码"}, status=400)
         dur = hashutil.audio_duration_seconds(dest)
-        # 重复检测
+        entry = {"path": dest, "name": filename, "bytes": written,
+                 "duration": dur, "hash": fhash}
+        if is_batch:
+            # current_files contains the original recordings plus the files
+            # already uploaded in this batch. Never discard the originals when
+            # a user adds more recordings to an existing lesson.
+            entries = current_files + [entry]
+            duration_values = [e.get("duration") for e in entries]
+            total_duration = (sum(float(v) for v in duration_values)
+                              if all(v is not None for v in duration_values) else None)
+            collection_hash = _audio_collection_hash(entries)
+            # 首段开始一个新的批次，但保留课堂已有的录音文件，避免意外删除。
+            if batch_index == 0:
+                db.snapshot_session(sid, "上传新录音前")
+            db.update_session(
+                sid, audio_path=entries[0]["path"], audio_hash=collection_hash,
+                audio_duration_seconds=total_duration, audio_manifest=json.dumps(
+                    entries, ensure_ascii=False),
+                status="ready_to_process" if defer_processing else "waiting_model", source_type="audio",
+            )
+        else:
+            # 重复检测
+            entries = [entry]
+            total_duration = dur
+            collection_hash = fhash
+            dup = db.read_conn().execute(
+                "SELECT id, course_id, session_date FROM class_sessions WHERE audio_hash=? AND id!=?",
+                (fhash, sid)).fetchone()
+            db.snapshot_session(sid, "上传新录音前")
+            db.update_session(sid, audio_path=dest, audio_hash=fhash,
+                              audio_duration_seconds=dur, audio_manifest=None,
+                              status="ready_to_process" if defer_processing else "waiting_model",
+                              source_type="audio")
+
+        # 批量模式只在最后一个文件到达后启动一次流水线。
+        if is_batch and batch_index < batch_count - 1:
+            return _send_json(self, {
+                "batch": True, "index": batch_index, "count": batch_count,
+                "uploaded": batch_index + 1, "duration": total_duration, "bytes": written,
+            })
+
+        if defer_processing:
+            return _send_json(self, {
+                "staged": True, "ready_to_process": True,
+                "duration": total_duration, "bytes": written,
+                "file_count": len(entries),
+            })
+
         dup = db.read_conn().execute(
             "SELECT id, course_id, session_date FROM class_sessions WHERE audio_hash=? AND id!=?",
-            (fhash, sid)).fetchone()
-        db.snapshot_session(sid, "上传新录音前")
-        db.update_session(sid, audio_path=dest, audio_hash=fhash,
-                          audio_duration_seconds=dur, status="waiting_model",
-                          source_type="audio")
+            (collection_hash, sid)).fetchone()
         if dup:
             LOG.info("检测到相同音频已存在于其它课堂: %s", dup["id"])
         job_id, err = start_pipeline(sid, "transcribe")
@@ -671,8 +792,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return _send_json(self, {"error": err, "dup_with": dup["id"] if dup else None}, status=409)
         return _send_json(self, {
             "job_id": job_id,
-            "duration": dur,
+            "duration": total_duration,
             "bytes": written,
+            "file_count": len(entries),
             "dup_with": dup["id"] if dup else None,
         })
 
@@ -749,6 +871,15 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _settings_get(self):
         s = db.get_all_settings()
+        # 将旧版本保存的 fast/balanced/accurate 档位迁移为唯一受支持的 Qwen 语音模型。
+        # 这样设置页、数据库和实际处理链路不会再出现“显示一个、运行另一个”的情况。
+        if s.get("whisper_tier") != manifest.DEFAULT_WHISPER_TIER:
+            s["whisper_tier"] = manifest.DEFAULT_WHISPER_TIER
+            db.set_setting("whisper_tier", manifest.DEFAULT_WHISPER_TIER)
+        default_llm_id = manifest.default_llm_model()["id"]
+        if s.get("llm_model_id") != default_llm_id:
+            s["llm_model_id"] = default_llm_id
+            db.set_setting("llm_model_id", default_llm_id)
         # 不返回明文密钥
         s.pop("openai_api_key", None)
         return _send_json(self, {
@@ -757,18 +888,25 @@ class ApiHandler(BaseHTTPRequestHandler):
             "llm_models": manifest.LLM_MODELS,
             "provider_status": detect_status(s),
             "whisper_device_options": [
-                {"value": "auto", "label": "自动（GPU 可用时优先，否则 CPU）"},
-                {"value": "cuda", "label": "优先 GPU（faster-whisper CUDA）"},
-                {"value": "cpu", "label": "仅 CPU（最稳）"},
+                {"value": "auto", "label": "自动（推荐：有可用显卡就用，否则 CPU）"},
+                {"value": "cuda", "label": "优先 NVIDIA GPU（不可用时自动回退 CPU）"},
+                {"value": "cpu", "label": "仅 CPU（更慢但兼容性最好）"},
             ],
-            "whisper_gpu": whisper_worker.gpu_info(),
-            "whisper_resolved": whisper_worker.resolve_device(
-                (s.get("whisper_device") or "auto")),
+            "whisper_gpu": whisper_worker.gpu_info(probe=False),
+            "whisper_resolved": {"device": "cpu" if (s.get("whisper_device") or "auto") == "cpu" else "auto",
+                                 "requested": s.get("whisper_device") or "auto",
+                                 "used_cuda": None, "reason": "处理时检测"},
         })
 
     def _settings_put(self):
         b = _read_json(self)
+        allowed = {
+            "ai_provider", "llm_model_id", "whisper_device", "ollama_model",
+            "openai_base_url", "openai_model", "openai_api_key",
+        }
         for k, v in b.items():
+            if k not in allowed:
+                continue
             if k == "openai_api_key":
                 if v:
                     from .credential import set_credential
@@ -778,6 +916,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     delete_credential("openai_api_key")
                 db.set_setting("openai_api_key_set", "1" if v else "0")
                 continue
+            if k == "llm_model_id":
+                # 当前产品只维护一条本地文字整理链路，旧版本选择自动迁移。
+                v = manifest.default_llm_model()["id"]
             if isinstance(v, bool):
                 db.set_setting(k, "1" if v else "0")
             elif isinstance(v, (int, float)):
@@ -787,22 +928,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         return _send_json(self, {"ok": True})
 
     def _test_whisper(self):
-        """真实加载模型并转写短音频，而不是只检查目录是否存在。"""
+        """Load the real Qwen model without touching classroom recordings."""
         try:
-            import tempfile
-            from . import selftest
-
-            # 系统 %TEMP% 可能被安全软件或受限账户禁止写入；应用的数据目录
-            # 已在启动时验证可写，用它承载一次性测试文件更可靠。
-            with tempfile.TemporaryDirectory(
-                prefix="ca_whisper_check_", dir=config.get_config().dirs.data_dir
-            ) as tmp:
-                settings = db.get_all_settings()
-                size = _resolve_whisper_size(settings.get("whisper_tier"), settings)
-                res = selftest._check_whisper_ready(tmp, size=size)
+            settings = db.get_all_settings()
+            res = whisper_worker.ensure_ready(settings.get("whisper_device") or "auto")
             return _send_json(self, {
-                "ok": bool(res.get("ready")),
-                "gpu": whisper_worker.gpu_info(),
+                "ok": True,
+                "device": res.get("device"),
+                "used_cuda": res.get("device") == "cuda",
                 "detail": res.get("detail", ""),
             })
         except Exception as e:  # noqa: BLE001
@@ -856,13 +989,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         return out
 
     def _validate_whisper(self):
-        """对所有已列出的 whisper tier 做严格校验，返回每档的 ok/reason/detail。"""
+        """Validate the one supported Qwen ASR model."""
         from .ai import whisper_worker as ww
-        b = _read_json(self)
-        sizes = b.get("sizes") if isinstance(b, dict) and b.get("sizes") else None
-        if not sizes:
-            sizes = [info["model_size"] for info in manifest.WHISPER_TIERS.values()]
-        results = {s: ww.validate_model_installation(s) for s in sizes}
+        _read_json(self)
+        results = {"Qwen3-ASR-0.6B": ww.validate_qwen_model_installation()}
         # 任意一个 broken 时给 200 但 overall 标记（前端据此显示红色提示）
         overall_ok = all(r.get("ok") for r in results.values())
         return _send_json(self, {
@@ -877,24 +1007,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         size = b.get("size")
         if not size:
             return _send_json(self, {"error": "缺少 size"}, status=400)
+        supported_size = manifest.WHISPER_TIERS[manifest.DEFAULT_WHISPER_TIER]["model_size"]
+        if size != supported_size:
+            return _send_json(self, {"error": "语音识别只支持 Qwen3-ASR-0.6B"}, status=400)
         r = ww.cleanup_broken_model(size)
         return _send_json(self, r)
 
     def _download_whisper(self):
         if MODEL_PROGRESS.get("whisper", {}).get("downloading"):
             return _send_json(self, {"ok": False, "error": "正在下载中"})
-        b = _read_json(self)
-        size = b.get("size") or manifest.WHISPER_TIERS[manifest.DEFAULT_WHISPER_TIER]["model_size"]
-        MODEL_PROGRESS["whisper"] = {"downloading": True, "stage": "下载语音模型中", "done": False, "error": None}
-        # 与 whisper_worker.models_root() 保持同源，否则会出现「下载完成了却仍提示未下载」
-        cache = whisper_worker.models_root()
+        _read_json(self)
+        MODEL_PROGRESS["whisper"] = {"downloading": True, "stage": "下载 Qwen3-ASR-0.6B", "done": False, "error": None}
 
         def _run():
             try:
-                from faster_whisper import WhisperModel
-                WhisperModel(size, device="cpu", compute_type="int8",
-                             download_root=cache)
-                if not whisper_worker.is_model_downloaded(size):
+                python = whisper_worker._qwen_worker_python()
+                code = (
+                    "from huggingface_hub import snapshot_download;import os;"
+                    "snapshot_download(repo_id='Qwen/Qwen3-ASR-0.6B',"
+                    "local_dir=os.environ['CLASSROOM_ASSISTANT_QWEN_MODEL_DIR'])"
+                )
+                env = os.environ.copy()
+                env["CLASSROOM_ASSISTANT_QWEN_MODEL_DIR"] = whisper_worker.qwen_model_dir()
+                result = subprocess.run(
+                    [python, "-c", code], env=env, capture_output=True, text=True,
+                    timeout=3600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout or "下载失败").strip()[-800:])
+                if not whisper_worker.is_model_downloaded():
                     raise RuntimeError("语音模型下载不完整，请重试")
                 MODEL_PROGRESS["whisper"] = {"downloading": False, "stage": "完成", "done": True, "error": None}
             except Exception as e:  # noqa: BLE001
@@ -959,7 +1100,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _import_model(self):
         """手动导入模型（下载被网络阻断时的兜底）。
 
-        请求：裸字节请求体；头部 X-Model-Type(llm|whisper|auto) 可选，
+        请求：裸字节请求体；头部 X-Model-Type(llm|auto) 可选，
         X-Model-Id 指定 LLM 目标 id（默认当前设置）。
         """
         try:
@@ -968,19 +1109,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not body:
                 return _send_json(self, {"error": "空文件"}, status=400)
             mtype = (self.headers.get("X-Model-Type") or "auto").strip().lower()
-            if mtype not in ("auto", "llm", "whisper"):
+            if mtype not in ("auto", "llm"):
                 return _send_json(self, {"error": "X-Model-Type 非法"}, status=400)
-            model_id = (self.headers.get("X-Model-Id") or "").strip()
-            if not model_id:
-                model_id = (db.get_all_settings().get("llm_model_id")
-                            or manifest.default_llm_model()["id"])
+            # 文字整理只保留当前官方 Qwen3-4B；旧版 id 不再创建新的文件名。
+            model_id = manifest.default_llm_model()["id"]
             cfg = config.get_config().dirs
             llm_dir = cfg.llm_models
-            # 与 whisper_worker.models_root() 同源（手动导入后必须能被 is_model_downloaded 识别）
-            whisper_dir = whisper_worker.models_root()
             res = mi.import_model_archive(
                 body, model_type=mtype, model_id=model_id,
-                llm_models_dir=llm_dir, whisper_models_dir=whisper_dir,
+                llm_models_dir=llm_dir,
             )
             if res.get("type") == "llm":
                 dest = res.get("dest", "")
@@ -988,11 +1125,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if os.path.isfile(dest):
                         os.remove(dest)
                     raise ValueError("导入的 GGUF 文件不完整或格式不正确")
-            elif res.get("type") == "whisper":
-                sizes = [x["model_size"] for x in manifest.WHISPER_TIERS.values()]
-                sizes.extend(manifest.WHISPER_EXTRA_SIZES)
-                if not any(whisper_worker.is_model_downloaded(size) for size in sizes):
-                    raise ValueError("导入包中没有找到完整的 faster-whisper 模型")
             LOG.info("手动导入模型成功: %s -> %s", mtype, res.get("dest"))
             return _send_json(self, {"ok": True, **res})
         except mi.SecurityError as e:
@@ -1029,37 +1161,181 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._delete_session_files(sid)
         db.delete_session(sid)
 
-    def _serve_session_audio(self, sid):
+    def _serve_session_audio(self, sid, index=0):
         sess = db.get_session(sid)
-        if not sess or not sess.get("audio_path") or not os.path.exists(sess["audio_path"]):
+        files = db.audio_files_for_session(sess)
+        if not files or index < 0 or index >= len(files) or not os.path.exists(files[index]["path"]):
             return _send_text(self, "无录音文件", status=404)
-        self._serve_file(sess["audio_path"])
+        self._serve_file(files[index]["path"])
+
+    def _delete_session_audio(self, sid):
+        sess = db.get_session(sid)
+        if not sess:
+            return _send_json(self, {"error": "课堂记录不存在"}, status=404)
+        if any(job.get("session_id") == sid for job in db.active_jobs()):
+            return _send_json(self, {"error": "这节课正在处理，完成或取消后再删除录音。"}, status=409)
+        segments = db.list_segments(sid)
+        staged = sess.get("status") == "ready_to_process"
+        if sess.get("status") != "completed" and not staged:
+            return _send_json(self, {"error": "请先完成转写与总结，再删除录音。"}, status=409)
+        if not segments and not staged:
+            return _send_json(self, {"error": "还没有可保留的转写文字，暂不能单独删除录音。"}, status=409)
+
+        files = db.audio_files_for_session(sess)
+        paths = {f.get("path") for f in files if f.get("path")}
+        if sess.get("audio_path"):
+            paths.add(sess["audio_path"])
+        if not paths:
+            return _send_json(self, {"error": "这节课没有录音文件"}, status=404)
+
+        # Imported recordings are copied into the app-managed audio directory.
+        # Never remove a separately saved original or a path outside that tree.
+        audio_root = os.path.normcase(os.path.realpath(config.get_config().dirs.audio))
+        try:
+            managed = all(
+                os.path.commonpath([audio_root, os.path.normcase(os.path.realpath(path))]) == audio_root
+                for path in paths
+            )
+        except ValueError:
+            managed = False
+        if not managed:
+            return _send_json(self, {"error": "这节课的录音路径不在课堂助手内部，不能自动删除；文字结果未更改。"}, status=409)
+
+        failures = []
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                os.remove(path)
+            except OSError as e:
+                failures.append(str(e))
+        if failures or any(os.path.exists(path) for path in paths):
+            LOG.warning("删除课堂录音失败 %s: %s", sid, failures)
+            return _send_json(self, {"error": "部分录音文件无法删除；转写与总结未更改，请关闭占用录音的程序后重试。"}, status=500)
+
+        db.update_session(sid, audio_path=None, audio_manifest=None, audio_hash=None,
+                          audio_duration_seconds=None,
+                          status="completed" if segments else "waiting_upload")
+        return _send_json(self, {"ok": True, "transcript_preserved": bool(segments), "audio_removed": True})
+
+    def _delete_staged_audio_file(self, sid, index):
+        sess = db.get_session(sid)
+        if not sess:
+            return _send_json(self, {"error": "课堂记录不存在"}, status=404)
+        if any(job.get("session_id") == sid for job in db.active_jobs()):
+            return _send_json(self, {"error": "这节课正在处理，完成或取消后再删除录音。"}, status=409)
+        if sess.get("status") != "ready_to_process":
+            return _send_json(self, {
+                "error": "只能逐段删除尚未处理的录音；处理完成后可删除本节全部录音并保留文字。"
+            }, status=409)
+
+        files = db.audio_files_for_session(sess)
+        if index < 0 or index >= len(files):
+            return _send_json(self, {"error": "录音文件不存在"}, status=404)
+        target = files[index]
+        audio_root = os.path.normcase(os.path.realpath(config.get_config().dirs.audio))
+        try:
+            managed = os.path.commonpath([
+                audio_root, os.path.normcase(os.path.realpath(target["path"]))
+            ]) == audio_root
+        except ValueError:
+            managed = False
+        if not managed:
+            return _send_json(self, {"error": "录音路径不在课堂助手内部，不能自动删除。"}, status=409)
+
+        if os.path.exists(target["path"]):
+            try:
+                os.remove(target["path"])
+            except OSError:
+                return _send_json(self, {"error": "录音文件暂时无法删除，请关闭占用它的程序后重试。"}, status=500)
+        if os.path.exists(target["path"]):
+            return _send_json(self, {"error": "录音文件仍被占用，请关闭占用它的程序后重试。"}, status=500)
+
+        remaining = [{key: file.get(key) for key in ("path", "name", "bytes", "duration", "hash")}
+                     for file in files if file["index"] != index]
+        durations = [file.get("duration") for file in remaining]
+        total_duration = (sum(float(value) for value in durations)
+                          if durations and all(value is not None for value in durations) else None)
+        db.update_session(
+            sid,
+            audio_path=remaining[0]["path"] if remaining else None,
+            audio_manifest=json.dumps(remaining, ensure_ascii=False) if remaining else None,
+            audio_hash=_audio_collection_hash(remaining) if remaining else None,
+            audio_duration_seconds=total_duration,
+            status="ready_to_process" if remaining else "waiting_upload",
+        )
+        return _send_json(self, {
+            "ok": True, "deleted_index": index, "file_count": len(remaining),
+            "audio_removed": True,
+        })
 
     def _serve_file(self, fpath):
         ctype = self._ctype(fpath)
+        if fpath.lower().endswith(".webm"):
+            ctype = "audio/webm"
         if ctype == "application/octet-stream" and fpath.lower().endswith((".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac")):
             ctype = "audio/" + os.path.splitext(fpath)[1].lower().lstrip(".")
-        with open(fpath, "rb") as f:
-            data = f.read()
-        self.send_response(200)
+        size = os.path.getsize(fpath)
+        start, end, status = 0, max(0, size - 1), 200
+        range_header = self.headers.get("Range", "")
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip()) if range_header else None
+        if match and size:
+            left, right = match.groups()
+            if left:
+                start = int(left)
+                end = min(int(right), size - 1) if right else size - 1
+            elif right:
+                count = min(int(right), size)
+                start, end = size - count, size - 1
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            status = 206
+        length = max(0, end - start + 1)
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
-        self.wfile.write(data)
+        with open(fpath, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining:
+                chunk = f.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _delete_session_files(self, sid):
         sess = db.get_session(sid)
         if not sess:
             return
-        if sess.get("audio_path") and os.path.exists(sess["audio_path"]):
-            try:
-                os.remove(sess["audio_path"])
-            except OSError:
-                pass
+        self._delete_audio_files(sess)
         tdir = os.path.join(config.get_config().dirs.transcripts, sid)
         if os.path.isdir(tdir):
             shutil.rmtree(tdir, ignore_errors=True)
+
+    def _delete_audio_files(self, sess):
+        seen = set()
+        for f in db.audio_files_for_session(sess):
+            path = f.get("path")
+            if path and path not in seen and os.path.exists(path):
+                seen.add(path)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        legacy = sess.get("audio_path")
+        if legacy and legacy not in seen and os.path.exists(legacy):
+            try:
+                os.remove(legacy)
+            except OSError:
+                pass
 
     # ---------------- 静态资源 ----------------
     def _serve_static(self, p):

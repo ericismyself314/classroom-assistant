@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import { Session, Segment, Topic, Item, CATEGORY_LABELS, CONFIDENCE_LABELS } from '../types';
+import { Session, Segment, Topic, Item, AudioFile, CATEGORY_LABELS, CONFIDENCE_LABELS } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { Modal } from '../components/Modal';
 import { View } from '../App';
 import { ClassNotes, ReviewNotes, Sources } from '../components/ClassNotes';
 import { RecognitionSettings, useRecognition } from '../components/RecognitionSettings';
+import { chineseEvidence, displaySummary, displayText, displayTitle, hasChinese } from '../chineseDisplay';
 
 const PROCESSING = new Set(['waiting_model', 'file_check', 'transcribing', 'analyzing', 'indexing']);
 
@@ -22,6 +23,8 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
   const [seek, setSeek] = useState<{ seconds: number } | null>(null);
   const jump = (seconds: number | null) => { if (seconds != null) setSeek({ seconds }); };
   const [duration, setDuration] = useState<number | null>(null);
+  const [deletingAudio, setDeletingAudio] = useState(false);
+  const [deletingAudioIndex, setDeletingAudioIndex] = useState<number | null>(null);
   const [recognitionOpen, setRecognitionOpen] = useState(false);
   const [history, setHistory] = useState<any>(null);
   const [err, setErr] = useState('');
@@ -49,13 +52,14 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
   }, [data]);
 
   if (!data) return <div className="empty">{err || '加载中…'}</div>;
-  const { session, course, segments, topics, items } = data as {
-    session: Session; course: any; segments: Segment[]; topics: Topic[]; items: Item[];
+  const { session, course, audio_files, segments, topics, items } = data as {
+    session: Session; course: any; audio_files?: AudioFile[]; segments: Segment[]; topics: Topic[]; items: Item[];
   };
   const processing = PROCESSING.has(session.status);
   const wrongLanguage = session.source_type === 'audio' && !!session.transcript_language && !['en', 'zh', 'mix'].includes(session.transcript_language);
   const pending = items.filter(i => !i.is_confirmed && (i.verification_status === 'pending' || i.confidence === 'uncertain'));
   const confirmed = items.filter(i => !pending.includes(i));
+  const sessionDisplayTitle = displayTitle(session.title || data.notes?.title || course.name, '');
 
   const reprocess = (mode: string) => { api.process(sid, { mode }).then(() => load()).catch((e) => setErr(e.message)); };
   const renameTitle = async () => {
@@ -66,20 +70,52 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
     catch (e: any) { setErr(e.message); }
   };
   const cancel = () => { if (job) api.cancelJob(job.id).then(() => load()); };
+  const openAudioWorkspace = (source: 'microphone' | 'upload') => navigate({
+    name: 'audio', courseId: session.course_id, sessionId: sid, date: session.session_date,
+    title: sessionDisplayTitle, source,
+  });
   const del = async () => {
     if (confirm('确定删除这次课堂吗？录音与转写将一并从本机删除。')) {
       await api.deleteSession(sid); navigate({ name: 'courses', courseId: session.course_id });
     }
   };
-  const presentationText = (s: Segment) => s.display_text ||
-    (session.transcript_language === 'zh' ? s.text : '中文展示稿尚未生成，请点击「仅重新分析」。');
+  const deleteAudio = async () => {
+    const confirmText = segments.length
+      ? '确定删除课堂助手内部保存的这节课全部录音吗？转写、中文整理和总结会保留；另存到其他文件夹的副本不受影响。删除后不能再根据录音重新转写。'
+      : '确定删除已暂存的课堂录音吗？这节课还没有转写文字；删除后可重新上传。另存到其他文件夹的副本不受影响。';
+    if (!confirm(confirmText)) return;
+    setDeletingAudio(true);
+    setErr('');
+    try {
+      await api.deleteSessionAudio(sid);
+      await load();
+    } catch (e: any) {
+      setErr(e.message || '删除录音失败');
+    } finally {
+      setDeletingAudio(false);
+    }
+  };
+  const deleteStagedAudio = async (file: AudioFile) => {
+    if (!confirm(`确定删除暂存录音“${file.name}”吗？其它录音不会受影响。`)) return;
+    setDeletingAudioIndex(file.index);
+    setErr('');
+    try {
+      await api.deleteStagedAudioFile(sid, file.index);
+      await load();
+    } catch (e: any) {
+      setErr(e.message || '删除这段录音失败');
+    } finally {
+      setDeletingAudioIndex(null);
+    }
+  };
+  const presentationText = (s: Segment) => displayText(s.display_text, hasChinese(s.text) ? s.text : '');
   const filtered = find ? segments.filter((s) => presentationText(s).includes(find)) : segments;
 
   return (
     <div className="session-notes">
       <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
         <div>
-          <div className="title-line"><h1 className="page-title">{session.title || data.notes?.title || course.name}</h1>
+          <div className="title-line"><h1 className="page-title">{sessionDisplayTitle}</h1>
             <button className="ghost title-edit" disabled={processing} onClick={renameTitle}>改标题</button></div>
           <p className="page-sub">
             {session.session_date}{session.week_number ? ` · 第${session.week_number}周` : ''} · {session.start_time || ''}–{session.end_time || ''} · <StatusBadge status={session.status} />
@@ -113,19 +149,78 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
         </div>
       )}
 
-      {session.audio_path && <AudioPlayer sessionId={sid} seekSignal={seek} onDuration={setDuration} />}
+      {session.status === 'ready_to_process' && session.audio_path && <div className="card audio-staged-banner">
+        <div><b>录音已保存 · 尚未开始处理</b>
+          <div className="small muted" style={{ marginTop: 4 }}>{audio_files?.length || 1} 段录音保存在这台电脑上。你可以现在转写并整理，或先在下方预听。</div>
+        </div>
+        <div className="row wrap">
+          <button className="primary" disabled={processing} onClick={() => reprocess('transcribe')}>开始转写并整理</button>
+          <button className="ghost danger" disabled={processing || deletingAudio} onClick={deleteAudio}>{deletingAudio ? '正在删除…' : '删除暂存录音'}</button>
+        </div>
+      </div>}
 
-      <ClassNotes notes={wrongLanguage ? null : data.notes} onSeek={jump} processing={processing} onEdit={setEditingChapter}
+      {session.status === 'ready_to_process' && !!audio_files?.length && <div className="card staged-audio-list">
+        <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+          <div><b>已上传录音 · {audio_files.length} 段</b><div className="small muted">尚未处理，可以逐段删除；开始处理后会合并为一节课。</div></div>
+        </div>
+        {audio_files.map((file, index) => <div className="staged-audio-row" key={`${file.index}-${file.name}`}>
+          <span className="audio-file-index">{String(index + 1).padStart(2, '0')}</span>
+          <span className="audio-file-meta"><b title={file.name}>{file.name}</b><small>{file.bytes == null ? '音频文件' : `${(file.bytes / 1024 / 1024).toFixed(1)} MB`}</small></span>
+          <button className="ghost danger audio-remove" disabled={deletingAudioIndex != null || deletingAudio}
+            onClick={() => deleteStagedAudio(file)}>{deletingAudioIndex === file.index ? '删除中…' : '删除'}</button>
+        </div>)}
+      </div>}
+
+      <div className="session-audio-heading"><h2>本节录音</h2><span>录制新内容与回听已有录音，入口分开显示</span></div>
+      <div className="session-audio-actions">
+        <section className="card session-audio-card session-record-card">
+          <div className="session-media-head">
+            <span className="session-media-icon record-icon" aria-hidden="true">🎙️</span>
+            <div><span className="audio-eyebrow">新增录音</span><h2>电脑录音 / 上传</h2></div>
+          </div>
+          <p>电脑录制时可暂停、继续；停止后先试听，再保存到电脑或加入本节课。</p>
+          <div className="session-recording-steps" aria-label="电脑录音步骤">
+            <span><i>1</i> 开始录音</span><span><i>2</i> 暂停 / 继续</span><span><i>3</i> 停止并试听</span>
+          </div>
+          <div className="session-recording-buttons">
+            <button className="primary" disabled={processing} onClick={() => openAudioWorkspace('microphone')}>电脑麦克风录音</button>
+            <button className="ghost" disabled={processing} onClick={() => openAudioWorkspace('upload')}>上传已有录音</button>
+          </div>
+        </section>
+
+        <section className="card session-audio-card session-play-card">
+          <div className="session-media-head">
+            <span className="session-media-icon play-icon" aria-hidden="true">▶</span>
+            <div><span className="audio-eyebrow">回听已保存内容</span><h2>播放录音</h2></div>
+          </div>
+          <p>试听本节已保存的音频；如果有多段录音，可在播放器中切换。</p>
+          {session.audio_path ? <AudioPlayer sessionId={sid} files={audio_files} seekSignal={seek}
+            onDuration={!audio_files || audio_files.length <= 1 ? setDuration : undefined} />
+            : <div className="session-playback-empty">
+              <span className="session-playback-symbol" aria-hidden="true">♫</span>
+              <b>本节还没有录音</b><span className="small muted">录制或上传后，可在这里播放和核对。</span>
+            </div>}
+        </section>
+      </div>
+      {session.audio_path && session.status === 'completed' && segments.length > 0 && <div className="audio-retention card">
+        <div>
+          <b>转写文字会保留</b>
+          <div className="small muted" style={{ marginTop: 3 }}>仅删除课堂助手内部的录音文件，完整转写、中文整理和总结会保留；另存到其他文件夹的副本仍在原处。</div>
+        </div>
+        <button className="ghost danger" disabled={processing || deletingAudio} onClick={deleteAudio}>{deletingAudio ? '正在删除…' : '删除录音，保留文字'}</button>
+      </div>}
+
+      <ClassNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} processing={processing} onEdit={setEditingChapter}
         beforeKnowledge={<>
           <div className="section-heading"><h2>非知识点内容</h2><span className="small muted">老师提到的作业、考试、通知与安排</span></div>
-          {!wrongLanguage && <ItemsBlock items={confirmed} onChange={load} onSeek={jump} teacherVoice />}
+          {!wrongLanguage && <ItemsBlock items={confirmed} segments={segments} onChange={load} onSeek={jump} teacherVoice />}
         </>} />
       {!data.notes && topics.length > 0 && <details className="legacy-notes"><summary>查看旧版总结 · 未按新规则核对</summary>
-        {topics.map(t => <div className="topic" key={t.id}><b>{t.title}</b><p>{t.summary}</p></div>)}
+        {topics.map(t => <div className="topic" key={t.id}><b>{displayTitle(t.title, chineseEvidence(t, segments))}</b><p>{displaySummary(t.summary, chineseEvidence(t, segments))}</p></div>)}
       </details>}
 
       <div className="section-heading"><h2>待核对</h2><span className="small muted">不把听不清、含义不明的内容当成结论</span></div>
-      <ItemsBlock items={wrongLanguage ? items : pending} onChange={load} onSeek={jump} />
+      <ItemsBlock items={wrongLanguage ? items : pending} segments={segments} onChange={load} onSeek={jump} />
       <ReviewNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} />
 
       <details className="transcript-fold">
@@ -221,23 +316,30 @@ function RecognitionModal({ courseId, hasAudio, onClose, onSaved, onTranscribe }
   </Modal>;
 }
 
-function ItemsBlock({ items, onChange, onSeek, teacherVoice = false }: { items: Item[]; onChange: () => void; onSeek: (s: number) => void; teacherVoice?: boolean }) {
+function ItemsBlock({ items, segments = [], onChange, onSeek, teacherVoice = false }: { items: Item[]; segments?: Segment[]; onChange: () => void; onSeek: (s: number) => void; teacherVoice?: boolean }) {
   const [editing, setEditing] = useState<Item | null>(null);
   if (items.length === 0) return <div className="muted small">暂无此类事项；以已完成的分析及课堂原话为准。</div>;
   return (
     <div>
-      {items.map((it) => (
+      {items.map((it) => {
+        let evidence: any[] = [];
+        try { evidence = it.evidence_data ? JSON.parse(it.evidence_data) : []; } catch { evidence = []; }
+        const evidenceText = chineseEvidence({ evidence }, segments);
+        const title = displayTitle(it.title, evidenceText);
+        const details = displayText(it.details, evidenceText);
+        const rawDate = displayText(it.raw_date_text, '未提供明确日期');
+        return (
         <div className={`item ${it.confidence === 'uncertain' ? 'uncertain' : ''}`} key={it.id}>
           <div className="row" style={{ justifyContent: 'space-between' }}>
             <div>
-              <span className="tag">{CATEGORY_LABELS[it.category] || it.category}</span>
-              <span className="it">{it.title}</span>
+              <span className="tag">{CATEGORY_LABELS[it.category] || '其它'}</span>
+              <span className="it">{title}</span>
             </div>
             <span className={`badge ${it.confidence === 'uncertain' ? 'warn' : 'green'}`}>{CONFIDENCE_LABELS[it.confidence]}</span>
           </div>
-          {it.details && (teacherVoice ? <div className="teacher-voice"><div className="small muted">老师的话（中文整理）</div><div>{it.details}</div></div> : <div className="small" style={{ marginTop: 4 }}>{it.details}</div>)}
+          {it.details && (teacherVoice ? <div className="teacher-voice"><div className="small muted">老师的话（中文整理）</div><div>{details}</div></div> : <div className="small" style={{ marginTop: 4 }}>{details}</div>)}
           <div className="small muted" style={{ marginTop: 4 }}>
-            {it.raw_date_text && <>原话「{it.raw_date_text}」 </>}
+            {it.raw_date_text && <>原话「{rawDate}」 </>}
             {it.normalized_date && <>→ {it.normalized_date} </>}
             {it.action_required ? '· 需要你采取行动' : ''}
             {it.is_confirmed ? ' · 已确认' : ''}{it.is_completed ? ' · 已完成' : ''}
@@ -245,7 +347,7 @@ function ItemsBlock({ items, onChange, onSeek, teacherVoice = false }: { items: 
           {it.evidence_data && (() => {
             try {
               const ev = JSON.parse(it.evidence_data);
-              if (ev.length) return <Sources evidence={ev} onSeek={onSeek} />;
+              if (ev.length) return <Sources evidence={ev} onSeek={onSeek} segments={segments} />;
             } catch { /* */ }
             return null;
           })()}
@@ -260,7 +362,8 @@ function ItemsBlock({ items, onChange, onSeek, teacherVoice = false }: { items: 
             <button className="ghost danger" onClick={() => api.deleteItem(it.id).then(onChange)}>删除误判</button>
           </div>
         </div>
-      ))}
+        );
+      })}
       {editing && <EditItem item={editing} onClose={() => setEditing(null)} onSave={onChange} />}
     </div>
   );

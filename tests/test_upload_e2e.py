@@ -18,10 +18,6 @@ import wave
 import urllib.request
 import urllib.error
 
-if "pytest" in sys.modules:
-    import pytest
-    pytest.skip("standalone API smoke check; run this file directly", allow_module_level=True)
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
@@ -127,11 +123,11 @@ assert j["ok"] is False
 assert all(r.get("reason") == "no_snapshot" for r in j["results"].values())
 print("    validate sizes:", list(j["results"].keys()))
 
-# 6c) /api/models/whisper/cleanup size=tiny
-st, body = req("/api/models/whisper/cleanup", "POST", {"size": "tiny"})
+# 6c) 清理入口只接受当前支持的 Qwen3-ASR 模型
+st, body = req("/api/models/whisper/cleanup", "POST", {"size": "Qwen3-ASR-0.6B"})
 assert st == 200, body
 j = json.loads(body)
-print("[6c] cleanup tiny ->", j)
+print("[6c] Qwen cleanup ->", j)
 assert j["now_downloaded"] is False
 
 # 7) 太长文件 -> 413

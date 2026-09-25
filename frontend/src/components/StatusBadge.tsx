@@ -2,6 +2,7 @@ import { Session } from '../types';
 
 const LABELS: Record<string, [string, string]> = {
   waiting_upload: ['等待上传', 'gray'],
+  ready_to_process: ['录音已保存 · 待处理', 'blue'],
   file_check: ['文件检查', 'blue'],
   waiting_model: ['等待模型', 'blue'],
   transcribing: ['正在转写', 'blue'],

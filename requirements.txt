@@ -1,9 +1,10 @@
-# 课堂助手 后端依赖（Python 3.13，Windows）
+# 课堂助手 后端依赖（Windows）
 # 安装：venv\Scripts\python.exe -m pip install -r requirements.txt
-faster-whisper==1.2.1
 pywebview==6.2.1
 httpx==0.28.1
 pydantic==2.13.5
+# Qwen3-ASR 在独立本地 Python 进程运行，避免把 PyTorch/CUDA 重复打进 GUI。
+qwen-asr==0.0.6
 # 注意：llama-cpp-python 在 Python 3.13 无预编译轮子，需 CUDA 预编译版（用于应用自管 LLM sidecar 的 Python 绑定）。
 # 本应用默认使用「下载 llama.cpp 服务端 exe」方案，不依赖 llama-cpp-python。
 # 若想用 Python 绑定方式，请安装：pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124

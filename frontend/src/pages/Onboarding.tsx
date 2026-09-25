@@ -60,9 +60,9 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const prepareModels = async () => {
     setPreparing(true); setTestMsg('正在准备离线模型，首次约需下载 4.5 GB，可以先继续填写课程…');
     try {
-      await api.saveSettings({ ai_provider: 'sidecar', whisper_tier: 'balanced', llm_model_id: 'qwen3-4b-q5_k_m' });
+      await api.saveSettings({ ai_provider: 'sidecar', whisper_device: 'auto', llm_model_id: 'qwen3-4b-q5_k_m' });
       const tasks: Promise<any>[] = [];
-      if (!readiness?.whisper_downloaded) tasks.push(api.downloadWhisper('large-v3-turbo'));
+      if (!readiness?.whisper_downloaded) tasks.push(api.downloadWhisper('Qwen3-ASR-0.6B'));
       if (!readiness?.llm_downloaded) tasks.push(api.downloadLlm());
       await Promise.all(tasks);
     } catch (e: any) {
@@ -188,7 +188,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         {readiness?.error && <div className="badge red">无法连接后端，请确认应用已正常启动后重试</div>}
         {readiness && !readiness.error && (
           <>
-            <ReadinessRow label={`语音识别模型（${readiness.whisper_model_size || 'large-v3-turbo'}）`} ok={!!readiness.whisper_downloaded} detail={readiness.whisper_downloaded ? '已就绪' : '尚未下载或文件不完整（可在「设置 → 模型」中下载）'} />
+            <ReadinessRow label={`语音识别模型（${readiness.whisper_model_size || 'Qwen3-ASR-0.6B'}）`} ok={!!readiness.whisper_downloaded} detail={readiness.whisper_downloaded ? '已就绪' : '尚未下载或文件不完整（可在「设置 → 模型」中下载）'} />
             <ReadinessRow label={`文字分析模型（${readiness.llm_model_label || 'Qwen3-4B (Q5_K_M)'}）`} ok={!!readiness.llm_downloaded} detail={readiness.llm_downloaded ? '已就绪' : '尚未下载或文件不完整（可在「设置 → 模型」中下载）'} />
             <ReadinessRow label="WebView2 运行环境" ok={!!readiness.webview2?.ok} detail={readiness.webview2?.detail || '未知'} />
             <ReadinessRow label="GPU 加速" ok={!!readiness.gpu?.available} detail={readiness.gpu?.name || (readiness.gpu?.available ? '可用' : '不可用，将使用 CPU（较慢）')} />

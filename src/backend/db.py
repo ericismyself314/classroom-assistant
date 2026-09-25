@@ -25,7 +25,7 @@ LOG = get_logger("db")
 
 _local = threading.local()
 _WRITE_LOCK = threading.RLock()
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 6
 
 
 # ----------------------------------------------------------------------------
@@ -244,6 +244,11 @@ MIGRATIONS: list[tuple[int, str]] = [
     (5, """
         -- 保留 ASR 英文原文，同时保存给用户看的简体中文展示稿。
         ALTER TABLE transcript_segments ADD COLUMN display_text TEXT;
+    """),
+    (6, """
+        -- 一节课可以由多个连续录音分段组成。audio_path 继续保留为首段，
+        -- audio_manifest 保存完整的有序文件清单，兼容旧数据库和旧接口。
+        ALTER TABLE class_sessions ADD COLUMN audio_manifest TEXT;
     """),
 ]
 
@@ -548,6 +553,48 @@ def get_session(sid: str) -> dict | None:
     return dict(r) if r else None
 
 
+def audio_files_for_session(session_or_id) -> list[dict]:
+    """Return ordered audio files for a session, including legacy single-file rows.
+
+    Paths are only used by the local backend. Callers that return this data to the
+    frontend should expose metadata, not the absolute paths.
+    """
+    session = get_session(session_or_id) if isinstance(session_or_id, str) else session_or_id
+    if not session:
+        return []
+    raw = session.get("audio_manifest")
+    if raw:
+        try:
+            entries = __import__("json").loads(raw)
+        except (TypeError, ValueError):
+            entries = []
+        if isinstance(entries, list):
+            files = []
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or not entry.get("path"):
+                    continue
+                files.append({
+                    "index": index,
+                    "path": entry["path"],
+                    "name": entry.get("name") or os.path.basename(entry["path"]),
+                    "bytes": entry.get("bytes"),
+                    "duration": entry.get("duration"),
+                    "hash": entry.get("hash"),
+                })
+            if files:
+                return files
+    if session.get("audio_path"):
+        return [{
+            "index": 0,
+            "path": session["audio_path"],
+            "name": os.path.basename(session["audio_path"]),
+            "bytes": None,
+            "duration": session.get("audio_duration_seconds"),
+            "hash": session.get("audio_hash"),
+        }]
+    return []
+
+
 def list_sessions(course_id: str, include_empty=True) -> list[dict]:
     rows = read_conn().execute(
         "SELECT * FROM class_sessions WHERE course_id=? ORDER BY session_date DESC", (course_id,)
@@ -558,7 +605,8 @@ def list_sessions(course_id: str, include_empty=True) -> list[dict]:
 def update_session(sid, **fields) -> None:
     allowed = {"session_date", "start_time", "end_time", "week_number", "title", "location",
                "status", "source_type", "audio_path", "audio_hash", "audio_duration_seconds",
-               "transcript_language", "transcription_model", "analysis_model", "processing_error", "notes_data"}
+               "audio_manifest", "transcript_language", "transcription_model", "analysis_model",
+               "processing_error", "notes_data"}
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
@@ -637,9 +685,9 @@ def update_segment_display_texts(session_id: str, segments: list[dict]) -> None:
     """Persist translated display text by source segment id without changing ASR text."""
     with write_txn() as c:
         for seg in segments:
-            if seg.get("id") and seg.get("display_text"):
+            if seg.get("id"):
                 c.execute("UPDATE transcript_segments SET display_text=?, updated_at=? WHERE id=? AND session_id=?",
-                          (seg["display_text"], now_iso(), seg["id"], session_id))
+                          (seg.get("display_text") or None, now_iso(), seg["id"], session_id))
 
 
 # ----------------------------------------------------------------------------

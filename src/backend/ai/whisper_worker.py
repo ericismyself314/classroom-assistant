@@ -1,4 +1,4 @@
-"""本地语音识别（faster-whisper）。
+"""本地语音识别（唯一支持 Qwen3-ASR-0.6B）。
 
 要点：
 - 在设置页下载模型；识别时只加载已经校验过的本地文件，不临时联网下载。
@@ -7,178 +7,263 @@
 - 转写结果保留片段级时间戳；低可信/可能听不清的片段标记 is_uncertain。
 - 优先保留老师实际使用的语言，不擅自翻译。
 
-历史坑（2026-09）：
-- `ctranslate2.get_cuda_device_count()` 只检测驱动/设备，**不代表运行库可用**。
-  在 PyInstaller 打包后的环境里，没有 nvidia-cublas-cu12 / nvidia-cudnn-cu12 等
-  pip 包的 DLL，ct2 仍报告 1 个设备，但实际 transcribe 时抛
-  `RuntimeError: Library cublas64_12.dll is not found or cannot be loaded`，
-  整次识别静默失败。
-- 修复：增加 `cuda_runtime_ready()` 真实可用性探测（加载 cublas 关键 DLL），
-  并在 `transcribe()` 中把"GPU 失败 → CPU 重试"作为兜底，保证上传录音不因
-  环境差异而崩。
+Qwen 在独立本地进程中加载，避免桌面进程混载不同 CUDA 原生运行库；GPU 失败时
+会自动改用 CPU 重试，语音识别始终只走 Qwen3-ASR。
 """
 from __future__ import annotations
 
-import ctypes
+import atexit
+import json
 import os
+import queue
+import re
+import shutil
 import sys
+import subprocess
 import threading
+import time
 
 from ..config import get_config
 from ..logutil import get_logger
 
 LOG = get_logger("whisper")
 
-# CTranslate2 的 tiny 模型也远大于 10 MiB。这个下限不是拿来替代模型
-# 自身的加载校验，而是避免残留空目录、测试占位文件和明显截断的下载被误报为
-# "已下载"。
-_MIN_MODEL_BIN_BYTES = 10 * 1024 * 1024
+# Keep the only supported ASR model in the user's data directory.
+_QWEN_MODEL_ID = "Qwen3-ASR-0.6B"
+_QWEN_MIN_MODEL_BYTES = 500 * 1024 * 1024
+_qwen_model_lock = threading.Lock()
+_qwen_external_worker = None
+_qwen_external_cuda_ready: bool | None = None
 
 
-def _repo_cache_names(size: str) -> list[str]:
-    """Return HuggingFace cache directory names used by faster-whisper.
+class _QwenExternalWorker:
+    """Keep Qwen's native runtime isolated from the frozen desktop process.
 
-    Most official converted models live under Systran, while faster-whisper
-    maps large-v3-turbo/turbo to mobiuslabsgmbh.  Keep the historical Systran
-    candidate as a fallback so an older manual import is not lost.
+    The installed Python runtime contains the verified Qwen stack, so the
+    desktop app talks to a small local JSON-lines worker instead. A worker is
+    reused for all recordings on the same device in one app session.
     """
-    names = []
-    if size in {"large-v3-turbo", "turbo"}:
-        names.append("models--mobiuslabsgmbh--faster-whisper-large-v3-turbo")
-    names.append("models--Systran--faster-whisper-" + size)
-    return list(dict.fromkeys(names))
 
+    def __init__(self, process, output_queue, requested_device: str):
+        self.process = process
+        self.output_queue = output_queue
+        self.requested_device = requested_device
+        self.device = requested_device
 
-# ---------------------------------------------------------------------------
-# CUDA 运行库真实可用性探测
-# ---------------------------------------------------------------------------
-# get_cuda_device_count() 报告 0/1 都不能直接当"能跑 GPU"用——前者可能是装了
-# CPU 版 ctranslate2，后者多见 PyInstaller 打包时漏掉 nvidia-cublas/cudnn 的
-# DLL。下面的探测既覆盖"关键 DLL 是否能被 LoadLibrary 加载"（毫秒级，失败 =
-# 立即 CPU），又留出运行时兜底处理"探测过但仍失败"的边角情况。
-_cuda_ready: bool | None = None
-_cuda_probe_lock = threading.Lock()
-_dll_directory_handles: dict[str, object] = {}
-_cuda_libraries: list[object] = []
+    def request(self, payload: dict, timeout: float = 900.0, progress_cb=None) -> dict:
+        """Send one request and wait while allowing long recordings to progress.
 
-# 探测重点：cuBLAS 是 CTranslate2 GPU 推理必用的；cuBLASLt / cuDNN / cuRAND
-# 在不同版本下或必须或可选，缺一会被 ct2 内部用 std::abort 拉崩。
-_CUDA_DLL_CANDIDATES = (
-    "cublasLt64_12.dll",
-    "cublas64_12.dll",
-    # CTranslate2 >= 4.5 的 Whisper 需要 CUDA 12 和 cuDNN 9。
-    # 只找到任意一个 cuBLAS DLL 不能证明显卡识别可用。
-    "cudnn64_9.dll",
-    "cudnn_ops64_9.dll",
-    "cudnn_cnn64_9.dll",
-)
-
-
-def _register_nvidia_dll_dirs() -> None:
-    """把 site-packages/nvidia/*/bin 加进 Windows DLL 搜索路径。
-
-    用户若额外安装了 `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` 等 pip 包，
-    DLL 不会自动被系统 PATH 找到，需要通过 `os.add_dll_directory` 注册。
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import site
-        from sysconfig import get_paths
-
-        candidates = list(site.getsitepackages() or [])
-        purelib = get_paths().get("purelib")
-        if purelib:
-            candidates.append(purelib)
-        if getattr(sys, "frozen", False):
-            candidates.append(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
-        seen: set[str] = set()
-        for base in candidates:
-            nvidia_root = os.path.join(base, "nvidia")
-            if not os.path.isdir(nvidia_root):
-                continue
-            for sub in os.listdir(nvidia_root):
-                bin_dir = os.path.join(nvidia_root, sub, "bin")
-                if os.path.isdir(bin_dir) and bin_dir not in seen:
-                    try:
-                        if bin_dir not in _dll_directory_handles:
-                            # 句柄必须活到进程结束，否则目录会立刻从搜索路径移除。
-                            _dll_directory_handles[bin_dir] = os.add_dll_directory(bin_dir)
-                        seen.add(bin_dir)
-                    except OSError:
-                        pass
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def cuda_runtime_ready() -> bool:
-    """cuBLAS 等 GPU 推理关键 DLL 实际可被加载。"""
-    global _cuda_ready
-    if _cuda_ready is not None:
-        return _cuda_ready
-    with _cuda_probe_lock:
-        if _cuda_ready is not None:
-            return _cuda_ready
-        if sys.platform != "win32":
-            # 非 Windows 留给真实 transcribe 时再判定（Linux/Mac 行为更线性）
-            _cuda_ready = True
-            return _cuda_ready
-        _register_nvidia_dll_dirs()
-        ok = True
-        loaded = []
-        for name in _CUDA_DLL_CANDIDATES:
+        The worker processes a recording in two-minute chunks.  A fixed
+        whole-file timeout made a long class fail after 15 minutes even though
+        the child process was still healthy and transcribing.  Progress lines
+        refresh the idle deadline; a genuinely stalled worker still fails
+        after ``timeout`` seconds without progress.
+        """
+        if self.process.poll() is not None:
+            raise RuntimeError(f"Qwen 语音服务已退出（exit={self.process.returncode}）")
+        try:
+            self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.process.stdin.flush()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"无法连接 Qwen 语音服务：{exc}") from exc
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Do not leave a child processing the same file after the GUI
+                # has marked the job failed.  The next request will start a
+                # fresh worker instead of consuming a stale response.
+                self.close()
+                raise RuntimeError("Qwen 语音服务长时间没有进度，请重试")
             try:
-                loaded.append(ctypes.WinDLL(name))
-            except OSError:
-                ok = False
-                break
-        if ok:
-            _cuda_libraries.extend(loaded)
-        _cuda_ready = ok
-        if not ok:
-            LOG.warning(
-                "显卡识别所需的 CUDA/cuDNN 运行库不完整；已自动改用 CPU，仍可本地识别录音。"
-            )
-        return _cuda_ready
+                line = self.output_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                if self.process.poll() is not None:
+                    raise RuntimeError(
+                        f"Qwen 语音服务已退出（exit={self.process.returncode}）"
+                    ) from exc
+                self.close()
+                raise RuntimeError("Qwen 语音服务长时间没有进度，请重试") from exc
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Qwen 语音服务返回了无效结果") from exc
+            if result.get("kind") == "progress":
+                processed = result.get("processed_seconds")
+                if progress_cb is not None and processed is not None:
+                    try:
+                        progress_cb(float(processed))
+                    except Exception:  # noqa: BLE001
+                        pass
+                # The timeout is an idle timeout, not a whole-recording cap.
+                deadline = time.monotonic() + timeout
+                continue
+            if not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "Qwen 语音服务识别失败"))
+            return result
+
+    def transcribe_file(self, audio_path: str, language: str | None, progress_cb=None) -> dict:
+        return self.request(
+            {"audio_path": audio_path, "language": language},
+            progress_cb=progress_cb,
+        )
+
+    def close(self) -> None:
+        try:
+            if self.process.poll() is None:
+                self.process.stdin.write(json.dumps({"shutdown": True}) + "\n")
+                self.process.stdin.flush()
+                self.process.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            try:
+                self.process.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
 
-def invalidate_cuda_ready() -> None:
-    """让下一次调用重新探测（用于用户安装好 nvidia-* 包后）。"""
-    global _cuda_ready
-    with _cuda_probe_lock:
-        _cuda_ready = None
+def _qwen_worker_script() -> str:
+    """Locate the worker script in source and PyInstaller layouts."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        candidates.append(os.path.join(base, "backend", "ai", "qwen_worker_service.py"))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "backend", "ai", "qwen_worker_service.py"))
+    candidates.append(os.path.join(os.path.dirname(__file__), "qwen_worker_service.py"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError("未找到 Qwen 语音服务文件，请重新安装课程助手")
 
 
-def gpu_info() -> dict:
-    """驱动/设备探测 + 运行库真实可用性。
+def _qwen_worker_python() -> str:
+    """Find the local Python that has the verified Qwen runtime installed."""
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        os.environ.get("CLASSROOM_ASSISTANT_PYTHON", ""),
+        os.path.join(local_appdata, "Programs", "Python", "Python312", "python.exe"),
+        os.path.join(local_appdata, "Programs", "Python", "Python311", "python.exe"),
+    ]
+    if not getattr(sys, "frozen", False):
+        candidates.insert(0, sys.executable)
+    candidates.append(shutil.which("python") or "")
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    raise RuntimeError("未找到可运行 Qwen 语音模型的本地 Python 环境")
 
-    返回字段：
-    - available: ctranslate2.get_cuda_device_count() > 0
-    - runtime_ready: cublas 等关键 DLL 可被加载
-    - usable: 上述两者都为 True（前端「可启用 GPU」可据此显示）
-    - device/count/name: 给前端展示用
-    """
-    base = {"available": False, "device": "cpu", "count": 0, "name": "CPU",
-            "runtime_ready": False, "usable": False, "reason": ""}
+
+def _start_qwen_external_worker(device: str) -> _QwenExternalWorker:
+    script = _qwen_worker_script()
+    python = _qwen_worker_python()
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["CLASSROOM_ASSISTANT_QWEN_MODEL_DIR"] = qwen_model_dir()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    process = subprocess.Popen(
+        [python, script, "--device", device],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+        creationflags=creationflags,
+    )
+    output_queue: queue.Queue[str] = queue.Queue()
+
+    def _read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                output_queue.put(line.strip())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _read_stderr() -> None:
+        try:
+            for line in process.stderr:
+                line = line.strip()
+                if line:
+                    LOG.info("Qwen 语音服务：%s", line)
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_read_stdout, name="qwen-worker-out", daemon=True).start()
+    threading.Thread(target=_read_stderr, name="qwen-worker-err", daemon=True).start()
+    worker = _QwenExternalWorker(process, output_queue, device)
     try:
-        from ctranslate2 import get_cuda_device_count
-        n = get_cuda_device_count()
-        if n > 0:
-            base = {"available": True, "device": "cuda", "count": n,
-                    "name": f"NVIDIA GPU（CUDA 设备数 = {n}）",
-                    "runtime_ready": False, "usable": False, "reason": ""}
+        ready = worker.request({"ready_check": True}, timeout=240.0)
+    except Exception:
+        worker.close()
+        raise
+    worker.device = str(ready.get("device") or device)
+    LOG.info("Qwen3-ASR 独立语音服务已连接，设备=%s", worker.device)
+    return worker
+
+
+def _probe_external_qwen_cuda() -> bool:
+    """Probe the system Qwen runtime without loading the 0.6B model."""
+    global _qwen_external_cuda_ready
+    if _qwen_external_cuda_ready is not None:
+        return _qwen_external_cuda_ready
+    try:
+        python = _qwen_worker_python()
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [python, "-c", "import torch; print('1' if torch.cuda.is_available() else '0')"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            creationflags=creationflags,
+        )
+        _qwen_external_cuda_ready = result.returncode == 0 and result.stdout.strip().endswith("1")
     except Exception:  # noqa: BLE001
-        pass
-    ready = cuda_runtime_ready()
-    base["runtime_ready"] = ready
-    base["usable"] = base["available"] and ready
-    if not base["available"]:
-        base["reason"] = "未检测到 NVIDIA GPU（驱动或设备）"
-        base["name"] = "CPU（未检测到 GPU）"
-    elif not ready:
-        base["reason"] = "显卡识别所需的 CUDA/cuDNN 运行库不完整"
-        base["name"] = "CPU（CUDA 运行库不可用）"
-    return base
+        _qwen_external_cuda_ready = False
+    return _qwen_external_cuda_ready
+
+
+def _close_qwen_external_worker() -> None:
+    global _qwen_external_worker
+    worker = _qwen_external_worker
+    _qwen_external_worker = None
+    if worker is not None:
+        worker.close()
+
+
+atexit.register(_close_qwen_external_worker)
+
+
+def gpu_info(probe: bool = True) -> dict:
+    """Report CUDA availability through the same PyTorch runtime as Qwen."""
+    if not probe:
+        return {"available": None, "device": "auto", "count": None,
+                "name": "处理时自动检测", "runtime_ready": None,
+                "usable": None, "reason": ""}
+    cuda_ready = False
+    device_count = 0
+    try:
+        if getattr(sys, "frozen", False):
+            cuda_ready = _probe_external_qwen_cuda()
+            device_count = int(cuda_ready)
+        else:
+            import importlib
+            torch = importlib.import_module("torch")
+            cuda_ready = bool(torch.cuda.is_available())
+            if cuda_ready:
+                device_count = max(1, int(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001
+        cuda_ready = False
+        device_count = 0
+    if cuda_ready:
+        return {"available": True, "device": "cuda", "count": device_count,
+                "name": "NVIDIA GPU（PyTorch CUDA）", "runtime_ready": True,
+                "usable": True, "reason": ""}
+    return {"available": False, "device": "cpu", "count": 0,
+            "name": "CPU（Qwen PyTorch CUDA 不可用）", "runtime_ready": False,
+            "usable": False, "reason": "未检测到可用的 PyTorch CUDA 设备"}
 
 
 def resolve_device(pref: str = "auto") -> dict:
@@ -213,187 +298,296 @@ def resolve_device(pref: str = "auto") -> dict:
             "reason": info["reason"] or "无可用 GPU", "gpu": info}
 
 
-def _cache_dir() -> str:
-    d = os.path.join(get_config().dirs.speech_models, ".hf_cache")
-    os.makedirs(d, exist_ok=True)
+def qwen_model_dir(create: bool = True) -> str:
+    """Return the local Qwen3-ASR model directory for the active data root."""
+    d = os.path.join(get_config().dirs.speech_models, _QWEN_MODEL_ID)
+    if create:
+        os.makedirs(d, exist_ok=True)
     return d
 
 
-def models_root() -> str:
-    """模型实际落盘目录（faster-whisper 的 download_root / 手动导入目标）。
-
-    必须让「下载/导入的写入目录」与「is_model_downloaded 的检测目录」是同一个：
-    历史 bug 是检测写在 _cache_dir() 根，而下载/导入写在 _cache_dir()/models，
-    导致模型明明已下载却一直被判定为「未下载」。
-    """
-    d = os.path.join(_cache_dir(), "models")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def is_model_downloaded(size: str) -> bool:
-    """判断某档 whisper 模型是否已下载。
-
-    同时兼容历史遗留布局（旧版本曾写到 _cache_dir() 根），避免老用户升级后
-    明明已下载却被要求重新下载。
-
-    关键修复：snapshot 目录里只是指向 blobs/ 的 symlink / hardlink；必须验证
-    链接**真实可解析到有内容的文件**，否则会出现「下载了 1MB 就以为 472MB
-    已就绪」的假阳性 —— 之前用户的 small 模型就是 snapshot 在但 blobs 空，
-    这里返回 True，实际加载时 ct2 报「Unable to open file model.bin」。
-    """
-    for root in (models_root(), _cache_dir()):
-        for name in _repo_cache_names(size):
-            if _valid_model_tree(os.path.join(root, name)):
-                return True
-    return False
-
-
-def validate_model_installation(size: str) -> dict:
-    """找到并校验实际会加载的本地快照；兼容旧目录和非 main 快照。"""
-    first_error = None
-    for root in (models_root(), _cache_dir()):
-        for name in _repo_cache_names(size):
-            repo_dir = os.path.join(root, name)
-            if not os.path.isdir(repo_dir):
-                continue
-            snapshots = os.path.join(repo_dir, "snapshots")
-            revisions = []
-            if os.path.isdir(snapshots):
-                revisions = [os.path.join(snapshots, d) for d in os.listdir(snapshots)
-                             if os.path.isdir(os.path.join(snapshots, d))]
-                revisions.sort(key=os.path.getmtime, reverse=True)
-                try:
-                    with open(os.path.join(repo_dir, "refs", "main"), encoding="utf-8") as f:
-                        main_ref = f.read().strip()
-                    preferred = os.path.join(snapshots, main_ref)
-                    if preferred in revisions:
-                        revisions.remove(preferred)
-                        revisions.insert(0, preferred)
-                except OSError:
-                    pass
-            if os.path.isfile(os.path.join(repo_dir, "model.bin")):
-                revisions.append(repo_dir)
-            for model_path in revisions:
-                result = _validate_model_snapshot(size, repo_dir, model_path)
-                if result["ok"]:
-                    return result
-                if first_error is None:
-                    first_error = result
-    return first_error or {"ok": False, "reason": "no_snapshot", "missing_files": [],
-                           "repo_dir": "", "model_path": "", "size": size,
-                           "detail": "未找到完整的本地模型快照，请在设置中下载语音模型"}
-
-
-def _validate_model_snapshot(size: str, repo_dir: str, rev_dir: str) -> dict:
-    """严格校验某档 whisper 模型是否真的可用。
-
-    检查项：
-    - snapshot 目录存在且至少一个 revision
-    - snapshot 里 model.bin / config.json / tokenizer.json / vocabulary.txt 全部
-      能被 `os.path.exists` + `os.path.getsize` 解析为非空文件（symlink / hardlink
-      跟随到 blobs 里也要真的有内容）
-    - 任意 blob 是断链（dangling symlink）或体积 < 10 MiB → 整体判定 broken
-
-    返回：
-    - ok: bool
-    - reason: "" / "blob_missing" / "blob_truncated" / "snapshot_empty" / "no_snapshot"
-    - missing_files: list[str]
-    - repo_dir: 实际命中的 repo 路径
-    - detail: 给前端展示的人话
-    """
-    out = {"ok": False, "reason": "", "missing_files": [], "repo_dir": repo_dir,
-           "model_path": rev_dir, "size": size, "detail": ""}
-
-    # 校验关键文件
-    required = ["model.bin", "config.json", "tokenizer.json"]
-    required_min = {"model.bin": _MIN_MODEL_BIN_BYTES}
-    for fn in required:
-        p = os.path.join(rev_dir, fn)
-        if not os.path.exists(p):
-            out["missing_files"].append(fn)
-            continue
-        # Windows 上 snapshot 文件可能是 symlink，要跟随
+def validate_qwen_model_installation() -> dict:
+    """Validate the Qwen3-ASR files without attempting a network download."""
+    repo_dir = qwen_model_dir(create=False)
+    required = [
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "model.safetensors",
+    ]
+    missing = []
+    for name in required:
+        path = os.path.join(repo_dir, name)
         try:
-            real = os.path.realpath(p)
-            if real != p and not os.path.exists(real):
-                out["missing_files"].append(fn)
-                continue
-            sz = os.path.getsize(real)
+            size = os.path.getsize(path)
         except OSError:
-            out["missing_files"].append(fn)
+            missing.append(name)
             continue
-        min_sz = required_min.get(fn, 1)
-        if sz < min_sz:
-            out["missing_files"].append(f"{fn} (size={sz} < {min_sz})")
-
-    # Current turbo snapshots use vocabulary.json; older Systran snapshots can
-    # use vocabulary.txt.  Either is a complete CTranslate2 vocabulary.
-    vocab_paths = [os.path.join(rev_dir, "vocabulary.json"),
-                   os.path.join(rev_dir, "vocabulary.txt")]
-    if not any(os.path.isfile(p) and os.path.getsize(p) > 0 for p in vocab_paths):
-        out["missing_files"].append("vocabulary.json/vocabulary.txt")
-
-    if out["missing_files"]:
-        out["reason"] = "blob_missing" if any(
-            "(size=" not in m for m in out["missing_files"]
-        ) else "blob_truncated"
-        out["detail"] = (
-            "模型文件缺失或不完整：" + ", ".join(out["missing_files"])
-            + "。请到「设置 → 模型」点击「重新校验」后再点「下载语音模型」。"
-        )
-        return out
-
-    out["ok"] = True
-    out["detail"] = "模型文件完整可用"
+        if name == "model.safetensors" and size < _QWEN_MIN_MODEL_BYTES:
+            missing.append(f"{name} (size={size} < {_QWEN_MIN_MODEL_BYTES})")
+    reason = "" if not missing else ("no_snapshot" if not os.path.isdir(repo_dir) else "model_missing")
+    out = {
+        "ok": not missing,
+        "reason": reason,
+        "missing_files": missing,
+        "repo_dir": repo_dir,
+        "model_path": repo_dir,
+        "size": _QWEN_MODEL_ID,
+        "backend": "qwen3-asr",
+        "detail": "Qwen3-ASR-0.6B 本地模型完整可用" if not missing else (
+            "Qwen3-ASR-0.6B 文件缺失或不完整：" + ", ".join(missing)
+        ),
+    }
     return out
 
 
+def is_model_downloaded(size: str = _QWEN_MODEL_ID) -> bool:
+    """Only the supported Qwen ASR model counts as ready."""
+    return size == _QWEN_MODEL_ID and bool(validate_qwen_model_installation()["ok"])
+
+
+def validate_model_installation(size: str) -> dict:
+    """Compatibility name for callers; never validates legacy Whisper caches."""
+    if size == _QWEN_MODEL_ID:
+        return validate_qwen_model_installation()
+    return {"ok": False, "size": size, "reason": "unsupported_model",
+            "detail": "语音识别只支持 Qwen3-ASR-0.6B"}
+
+
 def cleanup_broken_model(size: str) -> dict:
-    """删掉 broken 的模型 repo，让用户能重新下载。"""
-    import shutil
+    """删除唯一 Qwen 模型目录中的损坏下载；不删除完整模型。"""
+    if size != _QWEN_MODEL_ID:
+        raise ValueError("语音识别只支持 Qwen3-ASR-0.6B")
+    if validate_qwen_model_installation()["ok"]:
+        return {"size": size, "removed": [], "now_downloaded": True}
+
+    speech_root = os.path.abspath(get_config().dirs.speech_models)
+    model_dir = os.path.abspath(qwen_model_dir(create=False))
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    if (os.path.islink(model_dir) or is_junction(model_dir) or
+            os.path.normcase(os.path.dirname(model_dir)) != os.path.normcase(speech_root)):
+        raise ValueError("Qwen 模型目录不安全，已停止清理")
     removed = []
-    for root in (models_root(), _cache_dir()):
-        for name in _repo_cache_names(size):
-            cand = os.path.join(root, name)
-            if os.path.isdir(cand):
-                try:
-                    shutil.rmtree(cand, ignore_errors=True)
-                    removed.append(cand)
-                except Exception:  # noqa: BLE001
-                    pass
+    if os.path.isdir(model_dir):
+        shutil.rmtree(model_dir)
+        removed.append(model_dir)
     return {"size": size, "removed": removed, "now_downloaded": is_model_downloaded(size)}
 
 
-def _valid_model_tree(repo_dir: str) -> bool:
-    """确认缓存中至少存在一个结构完整、体积合理的模型快照。"""
-    if not os.path.isdir(repo_dir):
-        return False
-    for base, dirs, files in os.walk(repo_dir):
-        # HuggingFace 缓存通常是 snapshots/<revision>/；手动导入也允许把
-        # CTranslate2 文件直接放在仓库目录里。
-        if "model.bin" not in files or "config.json" not in files:
-            continue
-        if not ({"tokenizer.json", "vocabulary.json"} & set(files)):
-            continue
-        model_bin = os.path.join(base, "model.bin")
-        try:
-            if os.path.getsize(model_bin) >= _MIN_MODEL_BIN_BYTES:
-                return True
-        except OSError:
-            pass
-        # 不必继续深入一个已是快照的目录。
-        dirs[:] = []
-    return False
+def _looks_like_qwen_gpu_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "cuda", "cublas", "cudnn", "out of memory", "device_map", "gpu",
+    ))
 
 
-def _looks_like_cuda_runtime_error(exc: Exception) -> bool:
-    msg = str(exc)
-    if not msg:
-        return False
-    low = msg.lower()
-    keys = ("cublas", "cudnn", "curand", "cublaslt", "cuda", "library ", "dll")
-    return any(k in low for k in keys)
+def _qwen_language(language: str | None) -> str | None:
+    if language == "zh":
+        return "Chinese"
+    if language == "en":
+        return "English"
+    return None
+
+
+def _qwen_language_code(value: str | None, requested: str | None) -> str | None:
+    if requested == "mix":
+        return "mix"
+    if requested in {"zh", "en"}:
+        return requested
+    low = str(value or "").lower()
+    if "chinese" in low and "english" in low:
+        return "mix"
+    if "chinese" in low or "cantonese" in low or "中文" in low:
+        return "zh"
+    if "english" in low or "英文" in low:
+        return "en"
+    return None
+
+
+def _get_qwen_model(device: str):
+    """Load Qwen3-ASR once per device and reuse it for multi-recording jobs."""
+    global _qwen_external_worker, _qwen_external_cuda_ready
+    # Always isolate PyTorch, including source/development runs.  A native CUDA
+    # abort must never take the desktop process down with it.
+    with _qwen_model_lock:
+        desired_device = "cpu" if device == "cpu" else "cuda"
+        worker_live = (_qwen_external_worker is not None and
+                       _qwen_external_worker.process.poll() is None)
+        worker_matches = (worker_live and _qwen_external_worker.device == desired_device)
+        if not worker_matches:
+            if _qwen_external_worker is not None:
+                _qwen_external_worker.close()
+                _qwen_external_worker = None
+            requested = "cpu" if desired_device == "cpu" else "auto"
+            try:
+                _qwen_external_worker = _start_qwen_external_worker(requested)
+                if requested == "auto" and _qwen_external_worker.device != "cuda":
+                    _qwen_external_cuda_ready = False
+            except Exception:
+                if requested == "cpu":
+                    raise
+                LOG.warning("Qwen CUDA 服务启动失败，正在改用低内存 CPU 模式")
+                _qwen_external_cuda_ready = False
+                _qwen_external_worker = _start_qwen_external_worker("cpu")
+        return _qwen_external_worker
+
+def _load_audio_16k(audio_path: str):
+    """Decode supported classroom audio without librosa/numba dependencies."""
+    import av
+    import numpy as np
+
+    with av.open(audio_path) as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            raise ValueError("录音文件中没有音频轨道")
+        resampler = av.audio.resampler.AudioResampler(
+            format="fltp", layout="mono", rate=16000,
+        )
+        parts = []
+        for frame in container.decode(stream):
+            converted = resampler.resample(frame)
+            converted = converted if isinstance(converted, list) else [converted]
+            for out_frame in converted:
+                parts.append(np.asarray(out_frame.to_ndarray(), dtype=np.float32).reshape(-1))
+        converted = resampler.resample(None)
+        converted = converted if isinstance(converted, list) else [converted]
+        for out_frame in converted:
+            parts.append(np.asarray(out_frame.to_ndarray(), dtype=np.float32).reshape(-1))
+    if not parts:
+        raise ValueError("录音文件为空或无法解码")
+    wav = np.concatenate(parts).astype(np.float32, copy=False)
+    return np.clip(wav, -1.0, 1.0)
+
+
+def split_qwen_segment(text: str, start_seconds: float, end_seconds: float,
+                       max_chars: int = 240) -> list[dict]:
+    """Turn Qwen's coarse two-minute result into readable source segments.
+
+    Qwen ASR does not return word timestamps.  We split at punctuation and
+    allocate the original time span proportionally.  Keeping each source under
+    300 characters also makes translation and evidence verification reliable.
+    """
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    sentences = [p.strip() for p in re.split(
+        r"(?<=[。！？!?；;])\s*|(?<=[.])\s+(?=[A-Z0-9])", text
+    ) if p.strip()] or [text]
+    parts: list[str] = []
+    current = ""
+    for sentence in sentences:
+        while len(sentence) > max_chars:
+            cut = max(sentence.rfind("，", 0, max_chars),
+                      sentence.rfind(",", 0, max_chars),
+                      sentence.rfind(" ", 0, max_chars))
+            if cut < max_chars // 2:
+                cut = max_chars
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        combined = (current + (" " if current and sentence else "") + sentence).strip()
+        if current and len(combined) > max_chars:
+            parts.append(current)
+            current = sentence
+        else:
+            current = combined
+    if current:
+        parts.append(current)
+
+    total_chars = max(1, sum(len(part) for part in parts))
+    cursor = float(start_seconds)
+    duration = max(0.0, float(end_seconds) - float(start_seconds))
+    result = []
+    for index, part in enumerate(parts):
+        part_end = float(end_seconds) if index == len(parts) - 1 else (
+            cursor + duration * len(part) / total_chars
+        )
+        result.append({"start_seconds": round(cursor, 2),
+                       "end_seconds": round(part_end, 2), "text": part})
+        cursor = part_end
+    return result
+
+
+def _transcribe_qwen(audio_path: str, language: str | None = None,
+                     device: str = "cpu", progress_cb=None):
+    """Transcribe a local file with Qwen3-ASR using coarse timestamped chunks.
+
+    Qwen3-ASR returns one text result per input, while the rest of the app
+    consumes timestamped segments.  Splitting into two-minute windows keeps
+    the existing notes/evidence pipeline useful without requiring the optional
+    Qwen forced-aligner model.
+    """
+    import numpy as np
+
+    model = _get_qwen_model(device)
+    if isinstance(model, _QwenExternalWorker):
+        payload = model.transcribe_file(audio_path, language, progress_cb=progress_cb)
+        out = []
+        detected = None
+        for item in payload.get("results", []):
+            text = str(item.get("text") or "").strip()
+            detected = _qwen_language_code(item.get("language"), language) or detected
+            if not text:
+                continue
+            for part in split_qwen_segment(
+                text, float(item.get("start_seconds") or 0),
+                float(item.get("end_seconds") or 0),
+            ):
+                out.append({**part, "original_text": part["text"],
+                            "language": "mix" if language == "mix" else (detected or language),
+                            "confidence": None, "is_uncertain": False})
+        if not out:
+            raise ValueError("这段录音中没有识别到清晰的人声。请先播放录音确认有声音，再尝试重新转写。")
+        detected = "mix" if language == "mix" else detected
+        check_detected_language(detected, language)
+        if progress_cb:
+            duration = float(payload.get("duration_seconds") or 0)
+            if duration > 0:
+                progress_cb(duration)
+        LOG.info("Qwen 转写完成：%d 段，语言=%s，设备=%s", len(out), detected, model.device)
+        return out, detected, model.device
+
+    SAMPLE_RATE = 16000
+
+    wav = np.asarray(_load_audio_16k(audio_path), dtype=np.float32)
+    if wav.size == 0:
+        raise ValueError("录音文件为空")
+    duration = float(wav.shape[0]) / float(SAMPLE_RATE)
+    chunk_samples = int(120 * SAMPLE_RATE)
+    qwen_lang = _qwen_language(language)
+    out = []
+    detected = None
+    for start in range(0, wav.shape[0], chunk_samples):
+        end = min(wav.shape[0], start + chunk_samples)
+        chunk = wav[start:end]
+        if chunk.shape[0] < int(0.5 * SAMPLE_RATE):
+            chunk = np.pad(chunk, (0, int(0.5 * SAMPLE_RATE) - chunk.shape[0]))
+        result = model.transcribe(
+            audio=(chunk, SAMPLE_RATE),
+            language=qwen_lang,
+        )[0]
+        text = str(getattr(result, "text", "") or "").strip()
+        detected = _qwen_language_code(getattr(result, "language", None), language) or detected
+        if progress_cb:
+            progress_cb(float(end) / float(SAMPLE_RATE))
+        if not text:
+            continue
+        for part in split_qwen_segment(
+            text, start / float(SAMPLE_RATE), end / float(SAMPLE_RATE),
+        ):
+            out.append({**part, "original_text": part["text"],
+                        "language": "mix" if language == "mix" else (detected or language),
+                        "confidence": None, "is_uncertain": False})
+    if not out:
+        raise ValueError("这段录音中没有识别到清晰的人声。请先播放录音确认有声音，再尝试重新转写。")
+    detected = "mix" if language == "mix" else detected
+    check_detected_language(detected, language)
+    LOG.info("Qwen 转写完成：%d 段，语言=%s，设备=%s", len(out), detected, device)
+    return out, detected, device
 
 
 def recognition_options(language=None, vocabulary="") -> dict:
@@ -408,14 +602,25 @@ def recognition_options(language=None, vocabulary="") -> dict:
 
 
 def check_detected_language(language, requested=None):
-    if (requested or "auto") in {"auto", "mix"} and language not in {"en", "zh"}:
+    if (requested or "auto") in {"auto", "mix"} and language not in {"en", "zh", "mix"}:
         raise ValueError(
             f"自动识别得到的语言（{language}）与中英文课堂不符，已暂停，避免生成错误笔记。"
             "请在「识别设置」中选择老师实际使用的语言，再点「重新转写」。原录音和旧结果仍保留。")
 
 
-def transcribe(audio_path: str, size: str = "small", language: str | None = None,
-               device_pref: str = "auto", progress_cb=None, compute_type: str | None = None,
+def ensure_ready(device_pref: str = "auto") -> dict:
+    """Really load Qwen once and report the actual device, without using audio."""
+    validation = validate_qwen_model_installation()
+    if not validation["ok"]:
+        raise RuntimeError(validation["detail"])
+    plan = resolve_device(device_pref)
+    model = _get_qwen_model(plan["device"])
+    device = model.device if isinstance(model, _QwenExternalWorker) else plan["device"]
+    return {"ready": True, "device": device, "detail": validation["detail"]}
+
+
+def transcribe(audio_path: str, size: str = _QWEN_MODEL_ID, language: str | None = None,
+               device_pref: str = "auto", progress_cb=None,
                on_retry=None, vocabulary=""):
     """转写一段音频。
 
@@ -424,90 +629,39 @@ def transcribe(audio_path: str, size: str = "small", language: str | None = None
     - on_retry(reason, exc): GPU 失败回退 CPU 时回调，便于前端提示
       "已自动切换到 CPU 重新识别"。
     """
+    if size != _QWEN_MODEL_ID:
+        raise ValueError("语音识别只支持 Qwen3-ASR-0.6B")
     choice = resolve_device(device_pref)
     device = choice["device"]
-    if compute_type is None:
-        compute_type = "float16" if device == "cuda" else "int8"
 
     if choice["used_cuda"]:
-        LOG.info("加载语音模型 size=%s device=cuda compute_type=float16（偏好=%s）",
-                 size, device_pref)
+        LOG.info("使用 Qwen3-ASR，设备=GPU（偏好=%s）", device_pref)
     else:
         reason = choice.get("reason") or "无可用 GPU"
-        LOG.info("加载语音模型 size=%s device=cpu compute_type=int8（GPU 不可用：%s；偏好=%s）",
-                 size, reason, device_pref)
+        LOG.info("使用 Qwen3-ASR，设备=CPU（GPU 不可用：%s；偏好=%s）",
+                 reason, device_pref)
 
-    cache = _cache_dir()
-    os.environ.setdefault("HF_HOME", cache)
-    validation = validate_model_installation(size)
-    if not validation["ok"]:
-        raise RuntimeError(validation["detail"])
-
-    from faster_whisper import WhisperModel
-
-    def _do_transcribe(dev: str, ct: str):
-        model = WhisperModel(
-            validation["model_path"], device=dev, compute_type=ct,
-            download_root=models_root(), num_workers=1, local_files_only=True,
-            cpu_threads=min(6, max(1, (os.cpu_count() or 2) - 1)),
-        )
+    qwen_validation = validate_qwen_model_installation()
+    if qwen_validation["ok"]:
         try:
-            segments_iter, sinfo = model.transcribe(
-                audio_path,
-                **recognition_options(language, vocabulary),
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 500, "speech_pad_ms": 200},
-                condition_on_previous_text=False,
-                word_timestamps=False,
-                temperature=[0.0, 0.4, 0.8],
+            return _transcribe_qwen(
+                audio_path, language=language, device=device, progress_cb=progress_cb,
             )
-            check_detected_language(sinfo.language, language)
-            out = []
-            for seg in segments_iter:
-                if progress_cb:
-                    progress_cb(seg.end)
-                uncertain = segment_is_uncertain(seg)
-                text = (seg.text or "").strip()
-                if not text:
-                    continue
-                out.append({
-                    "start_seconds": round(float(seg.start), 2),
-                    "end_seconds": round(float(seg.end), 2),
-                    "text": text,
-                    "original_text": text,
-                    "language": "mix" if language == "mix" else sinfo.language,
-                    "confidence": None,
-                    "is_uncertain": uncertain,
-                })
-        finally:
-            del model
-        return out, "mix" if language == "mix" else sinfo.language, dev
-
-    try:
-        out, lang, dev = _do_transcribe(device, compute_type)
-    except Exception as e:  # noqa: BLE001
-        # 关键兜底：即便探测说 GPU 可用，运行时仍可能因 dll 路径/版本不匹配而崩。
-        # 自动改 CPU 重试一次，并让后续请求也不要再走 GPU（本次进程内）。
-        if device == "cuda" and _looks_like_cuda_runtime_error(e):
-            LOG.warning("GPU 转写失败，自动回退 CPU 重试一次：%s", e)
-            global _cuda_ready
-            with _cuda_probe_lock:
-                _cuda_ready = False
-            if on_retry is not None:
-                try:
-                    on_retry("cuda_failed_fallback_cpu", str(e))
-                except Exception:  # noqa: BLE001
-                    pass
-            out, lang, dev = _do_transcribe("cpu", "int8")
-        else:
+        except Exception as e:  # noqa: BLE001
+            if device == "cuda" and _looks_like_qwen_gpu_error(e):
+                LOG.warning("Qwen GPU 转写失败，自动回退 CPU 重试一次：%s", e)
+                if on_retry is not None:
+                    try:
+                        on_retry("cuda_failed_fallback_cpu", str(e))
+                    except Exception:  # noqa: BLE001
+                        pass
+                return _transcribe_qwen(
+                    audio_path, language=language, device="cpu", progress_cb=progress_cb,
+                )
             raise
 
-    if not out:
-        raise ValueError("这段录音中没有识别到清晰的人声。请先播放录音确认有声音，再尝试重新转写。")
-    LOG.info("转写完成：%d 段，语言=%s，设备=%s", len(out), lang, dev)
-    return out, lang, dev
-
+    # A missing Qwen model must be visible and actionable in Settings.
+    raise RuntimeError(qwen_validation["detail"])
 
 def segment_is_uncertain(seg):
     """Conservative signal, not an assertion that unflagged text is correct."""
