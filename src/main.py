@@ -10,7 +10,6 @@ from __future__ import annotations
 import sys
 import threading
 import time
-import os
 
 from backend import config, db
 from backend.ai import llm_provider
@@ -49,12 +48,9 @@ def main() -> None:
         start_control_server,
     )
 
-    # 打包冒烟测试可能与用户正在使用的安装版同时运行；只在显式测试环境
-    # 中跳过全局互斥体，正常启动仍保持单实例保护。
-    if os.environ.get("CLASSROOM_ASSISTANT_TEST_ALLOW_MULTI_INSTANCE") != "1":
-        if not acquire():
-            signal_focus()
-            sys.exit(0)
+    if not acquire():
+        signal_focus()
+        sys.exit(0)
 
     db.init_db()
     db.mark_interrupted_jobs()
@@ -84,6 +80,9 @@ def main() -> None:
 
     try:
         import webview
+        # Native classroom recordings can be saved through WebView2's Save As dialog.
+        # Downloads remain user-initiated by a visible button in the recorder UI.
+        webview.settings["ALLOW_DOWNLOADS"] = True
 
         def _focus_window() -> None:
             # pywebview 的 Window.focus 是布尔属性，不是可调用方法；旧代码
@@ -112,6 +111,8 @@ def main() -> None:
         # 用户数据目录。Windows 上这会反复触发 WebView2 冷启动，且临时目录
         # 创建失败时还会出现“无法创建数据目录”。使用应用自己的可写目录，
         # 让 WebView2 复用缓存和配置，后续启动明显更快。
+        import os
+
         # v2 使用全新的用户数据目录，避开旧版可能留下的损坏/陈旧缓存；
         # 后续静态资源同时通过 no-store 响应头避免版本升级后白屏。
         webview_profile = os.path.join(cfg.dirs.data_dir, "webview-v2")
@@ -124,8 +125,12 @@ def main() -> None:
             webview_profile = None
 
         ui_started_at = time.perf_counter()
+        # WebView2 may keep an old SPA document alive even when the local
+        # server sends no-store headers. Tie the document URL to index.html so
+        # a newly packaged frontend cannot be replaced by a stale cached page.
+        ui_url = _versioned_ui_url(url)
         window = webview.create_window(
-            "课堂助手", url, width=1280, height=820, min_size=(1024, 680)
+            "课堂助手", ui_url, width=1280, height=820, min_size=(1024, 680)
         )
 
         def _log_window_shown(*_args) -> None:
@@ -164,6 +169,21 @@ def _write_test_url_file(url: str) -> None:
         os.replace(tmp, path)
     except Exception:  # noqa: BLE001
         LOG.exception("写入测试端口文件失败")
+
+
+def _versioned_ui_url(url: str) -> str:
+    """Return a cache-busted URL that changes when the bundled index changes."""
+    import hashlib
+    import os
+
+    try:
+        from backend.api import DIST_DIR
+
+        with open(os.path.join(DIST_DIR, "index.html"), "rb") as f:
+            version = hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        version = "dev"
+    return f"{url}/?v={version}"
 
 
 def _shutdown(server=None) -> None:

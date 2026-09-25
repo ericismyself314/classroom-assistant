@@ -23,12 +23,8 @@ LOG = get_logger("pipeline")
 
 
 def _resolve_whisper_size(tier_or_size, settings: dict) -> str:
-    if tier_or_size and tier_or_size in aimanifest.WHISPER_TIERS:
-        return aimanifest.WHISPER_TIERS[tier_or_size]["model_size"]
-    if tier_or_size and tier_or_size in aimanifest.WHISPER_EXTRA_SIZES:
-        return tier_or_size
-    t = (settings or {}).get("whisper_tier", "balanced")
-    return aimanifest.WHISPER_TIERS.get(t, aimanifest.WHISPER_TIERS["balanced"])["model_size"]
+    # 旧数据库可能仍保存 fast/balanced/accurate；升级后无条件使用唯一的 Qwen ASR。
+    return aimanifest.WHISPER_TIERS[aimanifest.DEFAULT_WHISPER_TIER]["model_size"]
 
 
 def _report_transcribe(job_id, session_id, sec, duration=None):
@@ -42,6 +38,77 @@ def _report_transcribe(job_id, session_id, sec, duration=None):
     else:
         stage = f"语音识别中（已处理 {elapsed}）"
     db.update_job(job_id, stage=stage)
+
+
+def _transcribe_audio_files(session, course, settings, whisper_size, language, job_id):
+    """Transcribe all recordings in order and shift later timestamps forward."""
+    files = db.audio_files_for_session(session)
+    if not files:
+        raise FileNotFoundError("找不到原始录音文件，可能已被移动或删除")
+    for entry in files:
+        if not entry.get("path") or not os.path.exists(entry["path"]):
+            raise FileNotFoundError(f"找不到录音文件：{entry.get('name') or entry.get('path') or '未知文件'}")
+
+    durations = []
+    for entry in files:
+        duration = hashutil.audio_duration_seconds(entry["path"])
+        if duration is None and entry.get("duration") is not None:
+            try:
+                duration = float(entry["duration"])
+            except (TypeError, ValueError):
+                duration = None
+        durations.append(duration)
+    total_duration = sum(durations) if all(d is not None for d in durations) else None
+    if total_duration is not None:
+        db.update_session(session["id"], audio_duration_seconds=total_duration)
+        session["audio_duration_seconds"] = total_duration
+
+    device_pref = (settings.get("whisper_device") or "auto").lower()
+    requested_language = language or course.get("language_mode", "auto")
+    all_segments = []
+    detected_languages = []
+    offset = 0.0
+    used_device = "cpu"
+    for index, entry in enumerate(files):
+        if jobs.is_cancelled(session["id"]):
+            raise InterruptedError("已取消")
+        file_duration = durations[index]
+        db.update_job(job_id, stage=f"正在识别第 {index + 1}/{len(files)} 段录音")
+        try:
+            plan = whisper_worker.resolve_device(device_pref)
+            db.update_job(job_id, stage=(
+                f"正在读取第 {index + 1}/{len(files)} 段录音并加载本地模型（"
+                f"{'显卡加速' if plan['used_cuda'] else 'CPU 识别，大录音需要一些时间'}）"
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+        segments, detected, used_device = whisper_worker.transcribe(
+            entry["path"], size=whisper_size, language=requested_language,
+            device_pref=device_pref,
+            vocabulary=course.get("vocabulary", ""),
+            progress_cb=lambda sec, base=offset: _report_transcribe(
+                job_id, session["id"], base + sec, total_duration),
+            on_retry=lambda reason, msg: db.update_job(
+                job_id, stage="GPU 不可用，已自动切到 CPU 重新识别"),
+        )
+        detected_languages.append(detected)
+        for segment in segments:
+            shifted = dict(segment)
+            if shifted.get("start_seconds") is not None:
+                shifted["start_seconds"] = round(float(shifted["start_seconds"]) + offset, 2)
+            if shifted.get("end_seconds") is not None:
+                shifted["end_seconds"] = round(float(shifted["end_seconds"]) + offset, 2)
+            all_segments.append(shifted)
+        max_end = max((float(s.get("end_seconds") or 0) for s in segments), default=0.0)
+        offset += file_duration if file_duration is not None else max_end
+
+    if not all_segments:
+        raise ValueError("这些录音中没有识别到清晰的人声。请先播放录音确认有声音，再尝试重新转写。")
+    if requested_language == "mix" or len(set(detected_languages)) > 1:
+        detected_language = "mix"
+    else:
+        detected_language = detected_languages[0] if detected_languages else None
+    return all_segments, detected_language, used_device
 
 
 def run_pipeline(session_id, mode="transcribe", whisper_tier=None, language=None,
@@ -62,38 +129,14 @@ def run_pipeline(session_id, mode="transcribe", whisper_tier=None, language=None
         if mode in ("transcribe", "retranscribe"):
             db.update_session(session_id, status="file_check", processing_error=None)
             db.update_job(job_id, status="file_check", stage="检查音频文件")
-            ap = session.get("audio_path")
-            if not ap or not os.path.exists(ap):
-                raise FileNotFoundError("找不到原始录音文件，可能已被移动或删除")
-            # 修复旧版本把 PyAV 时长多除一次 1e6 写入数据库的记录；
-            # 重新处理时以文件实际元信息为准，避免证据时间戳被误判越界。
-            duration = hashutil.audio_duration_seconds(ap)
-            if duration is not None:
-                db.update_session(session_id, audio_duration_seconds=duration)
-                session["audio_duration_seconds"] = duration
-            device_pref = (settings.get("whisper_device") or "auto").lower()
             db.update_session(session_id, status="transcribing")
             db.update_job(job_id, status="transcribing",
                           stage="正在加载本地语音模型并读取录音，请稍候")
-            # 通知前端：本次识别计划用哪个设备（便于在 UI 提前提示「将使用 CPU 识别」）
-            try:
-                plan = whisper_worker.resolve_device(device_pref)
-                db.update_job(job_id, stage=(
-                    "正在读取录音并加载本地模型（%s）"
-                    % ("显卡加速" if plan["used_cuda"] else "CPU 识别，大录音需要一些时间")
-                ))
-            except Exception:  # noqa: BLE001
-                pass
-            segments, lang, device = whisper_worker.transcribe(
-                ap, size=whisper_size, language=language or course.get("language_mode", "auto"), device_pref=device_pref,
-                vocabulary=course.get("vocabulary", ""),
-                progress_cb=lambda sec: _report_transcribe(job_id, session_id, sec, duration),
-                on_retry=lambda reason, msg: db.update_job(
-                    job_id, stage="GPU 不可用，已自动切到 CPU 重新识别"),
-            )
+            segments, lang, device = _transcribe_audio_files(
+                session, course, settings, whisper_size, language, job_id)
             db.replace_segments(session_id, segments)
             db.update_session(session_id, transcript_language=lang,
-                              transcription_model=f"{whisper_size}/{device}", status="analyzing")
+                              transcription_model=f"Qwen3-ASR-0.6B/{device}", status="analyzing")
             # Do not display notes/evidence from the previous transcript as current.
             db.replace_topics(session_id, [])
             db.replace_items(session_id, [])

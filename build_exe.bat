@@ -41,7 +41,7 @@ if exist dist   rmdir /s /q dist
 echo [4/5] 已清理 build/ 与 dist/
 
 REM 5) 执行打包
-echo [5/5] 运行 PyInstaller（请耐心等待，faster-whisper 体积较大）...
+echo [5/5] 运行 PyInstaller（Qwen3-ASR 由独立本地 Python 服务承载）...
 pyinstaller build_exe.spec --noconfirm
 
 REM 实际产物名以 build_exe.spec 为准（COLLECT name=ClassroomAssistant）

@@ -1,26 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
-import { RecognitionSettings, useRecognition } from '../components/RecognitionSettings';
 import { api } from '../api';
-import { WeekDay, Session, SlotOcc } from '../types';
+import { WeekDay, SlotOcc } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { Modal } from '../components/Modal';
 import { View } from '../App';
 import { QuickGuide } from '../components/QuickGuide';
+import { localDateISO } from '../localDate';
 
 function shift(d: string, days: number): string {
   const dt = new Date(d + 'T00:00:00');
   dt.setDate(dt.getDate() + days);
-  return dt.toISOString().slice(0, 10);
+  return localDateISO(dt);
 }
 
 export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
-  const [center, setCenter] = useState(new Date().toISOString().slice(0, 10));
+  const [center, setCenter] = useState(localDateISO());
   const [week, setWeek] = useState<WeekDay[]>([]);
   const [semName, setSemName] = useState('');
   const [weekHint, setWeekHint] = useState('');
   const [loading, setLoading] = useState(true);
   const autoJumped = useRef(false);
-  const [target, setTarget] = useState<{ course_id: string; course_name: string; date: string; start: string; end: string; loc: string | null; sess: Session | null } | null>(null);
+  const [recordPickerOpen, setRecordPickerOpen] = useState(false);
+  const [recordSource, setRecordSource] = useState<'microphone' | 'upload'>('microphone');
 
   const load = () => {
     setLoading(true);
@@ -41,17 +42,25 @@ export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
 
   const openLesson = (occ: SlotOcc, date: string) => {
     if (occ.session) { navigate({ name: 'session', id: occ.session.id }); return; }
-    setTarget({ course_id: occ.course_id, course_name: occ.course_name, date, start: occ.start_time, end: occ.end_time, loc: occ.location, sess: null });
+    navigate({ name: 'audio', courseId: occ.course_id, date, title: occ.course_name });
   };
 
   return (
     <div>
-      <h1 className="page-title">本周</h1>
-      <p className="page-sub">{semName} · 选一节课，上传录音，完成后直接看重点</p>
+      <div className="row wrap" style={{ justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+        <div>
+          <h1 className="page-title">本周</h1>
+          <p className="page-sub">{semName} · 选择课程后，可直接录音或上传已有录音</p>
+        </div>
+        <div className="row week-audio-actions">
+          <button className="primary" disabled={loading} onClick={() => { setRecordSource('microphone'); setRecordPickerOpen(true); }}>电脑录音</button>
+          <button className="ghost" disabled={loading} onClick={() => { setRecordSource('upload'); setRecordPickerOpen(true); }}>上传已有录音</button>
+        </div>
+      </div>
       <QuickGuide />
       <div className="row" style={{ marginBottom: 14 }}>
         <button className="ghost" onClick={() => setCenter(shift(center, -7))}>← 上一周</button>
-        <button className="ghost" onClick={() => setCenter(new Date().toISOString().slice(0, 10))}>本周</button>
+        <button className="ghost" onClick={() => setCenter(localDateISO())}>本周</button>
         <button className="ghost" onClick={() => setCenter(shift(center, 7))}>下一周 →</button>
       </div>
       {weekHint && <div className="small muted" style={{ marginBottom: 10 }}>{weekHint}</div>}
@@ -66,84 +75,29 @@ export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
                 <div className="lesson" key={i} style={{ borderLeftColor: occ.color }} onClick={() => openLesson(occ, d.date)}>
                   <div className="lt">{occ.course_name}</div>
                   <div className="lm">{occ.start_time}–{occ.end_time}{occ.location ? ' · ' + occ.location : ''}</div>
-                  <div style={{ marginTop: 4 }}>{occ.session ? <StatusBadge status={occ.session.status} /> : <span className="badge gray">待上传</span>}</div>
+                  <div style={{ marginTop: 4 }}>{occ.session ? <StatusBadge status={occ.session.status} /> : <span className="badge gray">待录音 / 上传</span>}</div>
+                  <div className="small muted" style={{ marginTop: 5 }}>{occ.session ? '点击查看课堂，或在详情页点「电脑录音」' : '点击后可电脑录音或上传文件'}</div>
                 </div>
               ))}
             </div>
           ))}
         </div>
       )}
-      {target && <UploadModal target={target} onClose={() => setTarget(null)} onUploaded={(sid) => { setTarget(null); navigate({ name: 'session', id: sid }); }} />}
+      {recordPickerOpen && <Modal title={recordSource === 'microphone' ? '选择课程 · 电脑录音' : '选择课程 · 上传录音'} onClose={() => setRecordPickerOpen(false)}>
+        <p className="small muted">{recordSource === 'microphone' ? '进入后点击“开始录音”；录制中可以暂停或继续，停止后可试听、保存到电脑或加入课堂。' : '选择本周的一节课，上传已有录音；可一次添加多段并选择处理时间。'}</p>
+        {week.flatMap((day) => day.slots.map((occ) => ({ day, occ }))).map(({ day, occ }) => (
+          <button key={`${day.date}-${occ.course_id}-${occ.start_time}`} className="ghost" type="button"
+            style={{ display: 'flex', width: '100%', justifyContent: 'space-between', textAlign: 'left', marginBottom: 8, padding: '12px 14px' }}
+            onClick={() => { setRecordPickerOpen(false); navigate({ name: 'audio', courseId: occ.course_id, sessionId: occ.session?.id, date: day.date, title: occ.course_name, source: recordSource }); }}>
+            <span><b>{occ.course_name}</b><span className="small muted" style={{ display: 'block', marginTop: 3 }}>{day.date} · {occ.start_time}–{occ.end_time}</span></span>
+            <span className="small">{recordSource === 'microphone' ? '打开电脑录音' : '上传录音文件'} →</span>
+          </button>
+        ))}
+        {week.every((day) => day.slots.length === 0) && <div className="empty">
+          本周课表没有课程。可以先到课程页选择“新增课堂 / 电脑录音”。
+          <div style={{ marginTop: 10 }}><button className="primary" onClick={() => { setRecordPickerOpen(false); navigate({ name: 'courses' }); }}>前往课程</button></div>
+        </div>}
+      </Modal>}
     </div>
-  );
-}
-
-function UploadModal({ target, onClose, onUploaded }: {
-  target: any; onClose: () => void; onUploaded: (sid: string) => void;
-}) {
-  const recognition = useRecognition(target.course_id);
-  const [mode, setMode] = useState<'audio' | 'text'>('audio');
-  const [file, setFile] = useState<File | null>(null);
-  const [text, setText] = useState('');
-  const [lang, setLang] = useState('zh');
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState('');
-
-  const doCreate = async () => {
-    return api.createSession({
-      course_id: target.course_id, session_date: target.date,
-      start_time: target.start, end_time: target.end, location: target.loc, title: target.course_name,
-    });
-  };
-
-  const submit = async () => {
-    setMsg('');
-    if (mode === 'audio' && !file) { setMsg('先选择一个录音文件'); return; }
-    if (mode === 'text' && !text.trim()) { setMsg('先粘贴转写文字'); return; }
-    setBusy(true);
-    try {
-      if (mode === 'audio') {
-        if (!recognition.ready) throw new Error(recognition.error || '课程设置还在加载，请稍候');
-        await recognition.save();
-      }
-      const { id } = await doCreate();
-      if (mode === 'audio') {
-        const r = await api.uploadAudio(id, file!);
-        if (r.error) { setMsg(r.error); setBusy(false); return; }
-      } else {
-        await api.importTranscript(id, { text, language: lang });
-      }
-      onUploaded(id);
-    } catch (e: any) { setMsg(e.message || '处理失败'); setBusy(false); }
-  };
-
-  return (
-    <Modal title={`上传课堂 · ${target.course_name}`} onClose={onClose}
-      footer={<><button className="ghost" onClick={onClose}>取消</button><button className="primary" disabled={busy} onClick={submit}>{busy ? '处理中…' : '开始处理'}</button></>}>
-      <div className="muted small">日期 {target.date} · {target.start}–{target.end}</div>
-      <div className="row" style={{ margin: '12px 0' }}>
-        <button className={mode === 'audio' ? 'primary' : ''} onClick={() => setMode('audio')}>上传录音</button>
-        <button className={mode === 'text' ? 'primary' : ''} onClick={() => setMode('text')}>导入转写文字</button>
-      </div>
-      {mode === 'audio' ? (
-        <div className="drop-zone">
-          <b>{file ? file.name : '选择课堂录音'}</b>
-          <span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : '支持 MP3、M4A、WAV、AAC、FLAC、OGG、MP4'}</span>
-          <input type="file" accept=".mp3,.m4a,.wav,.aac,.flac,.ogg,.mp4" onChange={(e) => setFile(e.target.files?.[0] || null)} />
-        </div>
-      ) : (
-        <>
-          <label>语言</label>
-          <select value={lang} onChange={(e) => setLang(e.target.value)}>
-            <option value="zh">中文</option><option value="en">英文</option><option value="auto">自动</option>
-          </select>
-          <label>转写文字（支持 [mm:ss] 时间戳）</label>
-          <textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="粘贴真实课堂转写；有时间戳也可以一并粘贴。" />
-        </>
-      )}
-      {mode === 'audio' && <RecognitionSettings value={recognition.value} onChange={recognition.setValue} disabled={busy || !recognition.ready} />}
-      {recognition.error && <p role="alert">{recognition.error}</p>}
-      {msg && <div className="badge red" style={{ marginTop: 10 }}>{msg}</div>}
-    </Modal>
   );
 }

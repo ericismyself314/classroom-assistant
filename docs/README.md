@@ -19,8 +19,8 @@
 
 ## 一、它能做什么
 
-- **真实本地语音识别**：基于 `faster-whisper`，首用自动下载模型（快速 / 平衡 / 准确三档），支持中文。
-- **真实本地大模型分析**：基于 `llama.cpp` 自管的本地推理服务（Qwen2.5 系列 GGUF），把转写文本提炼成：
+- **真实本地语音识别**：固定使用本地 `Qwen3-ASR-0.6B`，首用准备一次即可，支持中英文课堂。
+- **真实本地大模型分析**：基于 `llama.cpp` 自管的本地推理服务（默认 Qwen3-4B GGUF），把转写文本提炼成：
   - 课堂概览（主题 + 小结）
   - 重要事项（考试 / 作业 / 调课 / 活动 / 其它），并附**原始证据片段与时间戳**
 - **五页导航**：本周 / 课程 / 重要事项 / 搜索 / 设置。
@@ -45,15 +45,13 @@
 | 桌面窗口 | `pywebview`（WebView2，原生窗口承载前端） |
 | 前端 | React 18 + TypeScript + Vite（`frontend/`） |
 | 后端 | Python 3.13 标准库 `http.server`（同进程内本地 API，仅监听 `127.0.0.1`） |
-| 语音识别 | `faster-whisper` 1.2.1（CTranslate2，支持 GPU/CPU） |
-| 文字分析 | `llama.cpp` sidecar（`llama-server.exe` + Qwen2.5 GGUF，仅监听 `127.0.0.1`，退出时关闭） |
+| 语音识别 | `Qwen3-ASR-0.6B`（独立本地 Python 服务，支持 GPU/CPU） |
+| 文字分析 | `llama.cpp` sidecar（`llama-server.exe` + Qwen3-4B GGUF，仅监听 `127.0.0.1`，退出时关闭） |
 | 数据库 | SQLite（WAL 模式 + FTS5 trigram 全文索引） |
 | 敏感信息 | Windows DPAPI（`backend/credential.py`） |
 
-后端同时支持三种 LLM 提供方（设置页可切换）：
-1. **自动（默认）**：优先 sidecar，其次本机 Ollama，再次 OpenAI 兼容 API。
-2. **Ollama**：本机已装 Ollama 时直接对接。
-3. **OpenAI 兼容**：填入 base_url + 密钥（密钥 DPAPI 加密）。
+当前设置页固定使用本地 sidecar；后端仍保留 Ollama / OpenAI 兼容 Provider，供旧数据和开发者兼容，
+但不会在普通用户的模型设置中出现，也不会在打开设置时主动探测。
 
 ---
 

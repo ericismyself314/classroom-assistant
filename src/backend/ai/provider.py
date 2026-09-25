@@ -80,7 +80,13 @@ def detect_status(settings: dict) -> dict:
     """返回各 Provider 可用性，供设置页展示。"""
     llm_model_id = (settings or {}).get("llm_model_id") or manifest.default_llm_model()["id"]
     sidecar = LlamaCppSidecarLLM(llm_model_id)
-    ollama_available, ollama_models = _ollama_status((settings or {}).get("ollama_model") or "")
+    # The supported default is the bundled local sidecar. Avoid probing an
+    # optional Ollama service whenever Settings opens; that made the page slow.
+    pref = str((settings or {}).get("ai_provider") or "sidecar").lower()
+    if pref == "ollama":
+        ollama_available, ollama_models = _ollama_status((settings or {}).get("ollama_model") or "")
+    else:
+        ollama_available, ollama_models = False, []
     return {
         "sidecar": {
             "available": sidecar.available(),

@@ -51,32 +51,51 @@ def _timebase_seconds(value, time_base) -> float | None:
 
 
 def audio_duration_seconds(path: str) -> float | None:
-    """读取音频时长（秒）。优先用 PyAV（支持 mp3/m4a/wav/aac/flac/ogg/mp4）。"""
+    """读取音频时长（秒），包含浏览器录音常见的无时长 WebM。"""
     try:
         import av
 
         with av.open(path) as container:
             if container.duration is not None:
                 duration = _timebase_seconds(container.duration, av.time_base)
-                if duration is not None:
+                if duration is not None and duration > 0:
                     return duration
             # 回退：用流帧数估算
+            audio_stream = None
             for stream in container.streams:
-                if stream.type != "audio" or stream.duration is None:
+                if stream.type != "audio":
+                    continue
+                if audio_stream is None:
+                    audio_stream = stream
+                if stream.duration is None:
                     continue
                 duration = _timebase_seconds(stream.duration, getattr(stream, "time_base", None))
-                if duration is not None:
+                if duration is not None and duration > 0:
                     return duration
                 # 极旧的 PyAV/解码器可能没有流 time_base，最后才用采样率兜底。
-                if getattr(stream, "rate", None):
+                if getattr(stream, "rate", None) and stream.duration > 0:
                     return float(stream.duration) / float(stream.rate)
-            return None
+            if audio_stream is None:
+                return None
+            # MediaRecorder 生成的 WebM 通常没有容器/流级时长；读取最后一个
+            # 音频包的结束时间，保留多段课堂之间的停顿与正确时间轴。
+            last_end = 0.0
+            for packet in container.demux(audio_stream):
+                timestamp = packet.pts if packet.pts is not None else packet.dts
+                if timestamp is None:
+                    continue
+                end = timestamp + (packet.duration or 0)
+                seconds = _timebase_seconds(end, getattr(packet, "time_base", None)
+                                            or getattr(audio_stream, "time_base", None))
+                if seconds is not None:
+                    last_end = max(last_end, seconds)
+            return last_end or None
     except Exception as e:  # noqa: BLE001
         LOG.warning("无法读取音频时长 %s: %s", path, e)
         return None
 
 
-SUPPORTED_AUDIO_EXT = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".mp4", ".mov"}
+SUPPORTED_AUDIO_EXT = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".webm", ".mp4", ".mov"}
 
 
 def is_supported_audio(path: str) -> bool:
