@@ -1,26 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
-import { RecognitionSettings, useRecognition } from '../components/RecognitionSettings';
 import { api } from '../api';
-import { WeekDay, Session, SlotOcc } from '../types';
+import { WeekDay, SlotOcc } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
-import { Modal } from '../components/Modal';
 import { View } from '../App';
-import { QuickGuide } from '../components/QuickGuide';
+import { localDateISO } from '../localDate';
 
 function shift(d: string, days: number): string {
   const dt = new Date(d + 'T00:00:00');
   dt.setDate(dt.getDate() + days);
-  return dt.toISOString().slice(0, 10);
+  return localDateISO(dt);
 }
 
 export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
-  const [center, setCenter] = useState(new Date().toISOString().slice(0, 10));
+  const [center, setCenter] = useState(localDateISO());
   const [week, setWeek] = useState<WeekDay[]>([]);
   const [semName, setSemName] = useState('');
   const [weekHint, setWeekHint] = useState('');
   const [loading, setLoading] = useState(true);
   const autoJumped = useRef(false);
-  const [target, setTarget] = useState<{ course_id: string; course_name: string; date: string; start: string; end: string; loc: string | null; sess: Session | null } | null>(null);
+  const [selectedDate, setSelectedDate] = useState(localDateISO());
 
   const load = () => {
     setLoading(true);
@@ -30,6 +28,7 @@ export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
         autoJumped.current = true;
         setWeekHint(`学期从 ${start} 开始，已显示第一周`);
         setCenter(start);
+        setSelectedDate(start);
         return;
       }
       setWeek(r.week);
@@ -41,109 +40,94 @@ export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
 
   const openLesson = (occ: SlotOcc, date: string) => {
     if (occ.session) { navigate({ name: 'session', id: occ.session.id }); return; }
-    setTarget({ course_id: occ.course_id, course_name: occ.course_name, date, start: occ.start_time, end: occ.end_time, loc: occ.location, sess: null });
+    navigate({ name: 'audio', courseId: occ.course_id, date, title: occ.course_name });
   };
 
-  return (
-    <div>
-      <h1 className="page-title">本周</h1>
-      <p className="page-sub">{semName} · 选一节课，上传录音，完成后直接看重点</p>
-      <QuickGuide />
-      <div className="row" style={{ marginBottom: 14 }}>
-        <button className="ghost" onClick={() => setCenter(shift(center, -7))}>← 上一周</button>
-        <button className="ghost" onClick={() => setCenter(new Date().toISOString().slice(0, 10))}>本周</button>
-        <button className="ghost" onClick={() => setCenter(shift(center, 7))}>下一周 →</button>
-      </div>
-      {weekHint && <div className="small muted" style={{ marginBottom: 10 }}>{weekHint}</div>}
-      {loading ? <div className="empty">加载中…</div> : (
-        <div className="week">
-          {week.map((d) => (
-            <div className={`day ${d.is_today ? 'today' : ''}`} key={d.date}>
-              <div className="dname">{d.weekday_cn}</div>
-              <div className="ddate">{d.date.slice(5)}</div>
-              {d.slots.length === 0 && <div className="small muted">无课</div>}
-              {d.slots.map((occ, i) => (
-                <div className="lesson" key={i} style={{ borderLeftColor: occ.color }} onClick={() => openLesson(occ, d.date)}>
-                  <div className="lt">{occ.course_name}</div>
-                  <div className="lm">{occ.start_time}–{occ.end_time}{occ.location ? ' · ' + occ.location : ''}</div>
-                  <div style={{ marginTop: 4 }}>{occ.session ? <StatusBadge status={occ.session.status} /> : <span className="badge gray">待上传</span>}</div>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-      )}
-      {target && <UploadModal target={target} onClose={() => setTarget(null)} onUploaded={(sid) => { setTarget(null); navigate({ name: 'session', id: sid }); }} />}
-    </div>
-  );
-}
-
-function UploadModal({ target, onClose, onUploaded }: {
-  target: any; onClose: () => void; onUploaded: (sid: string) => void;
-}) {
-  const recognition = useRecognition(target.course_id);
-  const [mode, setMode] = useState<'audio' | 'text'>('audio');
-  const [file, setFile] = useState<File | null>(null);
-  const [text, setText] = useState('');
-  const [lang, setLang] = useState('zh');
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState('');
-
-  const doCreate = async () => {
-    return api.createSession({
-      course_id: target.course_id, session_date: target.date,
-      start_time: target.start, end_time: target.end, location: target.loc, title: target.course_name,
+  const addAudio = (occ: SlotOcc, date: string, source: 'microphone' | 'upload') => {
+    navigate({
+      name: 'audio', courseId: occ.course_id, sessionId: occ.session?.id,
+      date, title: occ.course_name, source,
     });
   };
 
-  const submit = async () => {
-    setMsg('');
-    if (mode === 'audio' && !file) { setMsg('先选择一个录音文件'); return; }
-    if (mode === 'text' && !text.trim()) { setMsg('先粘贴转写文字'); return; }
-    setBusy(true);
-    try {
-      if (mode === 'audio') {
-        if (!recognition.ready) throw new Error(recognition.error || '课程设置还在加载，请稍候');
-        await recognition.save();
-      }
-      const { id } = await doCreate();
-      if (mode === 'audio') {
-        const r = await api.uploadAudio(id, file!);
-        if (r.error) { setMsg(r.error); setBusy(false); return; }
-      } else {
-        await api.importTranscript(id, { text, language: lang });
-      }
-      onUploaded(id);
-    } catch (e: any) { setMsg(e.message || '处理失败'); setBusy(false); }
+  const selectedDay = week.find((day) => day.date === selectedDate) || week[0];
+  const pending = week.flatMap((day) => day.slots
+    .filter((occ) => occ.session && ['ready_to_process', 'failed'].includes(occ.session.status))
+    .map((occ) => ({ day, occ })))
+    .filter(({ day }) => day.date !== selectedDay?.date)
+    .slice(0, 5);
+  const shiftWeek = (days: number) => {
+    setCenter((current) => shift(current, days));
+    setSelectedDate((current) => shift(current, days));
   };
+  const isCurrentWeek = week.some((day) => day.is_today);
 
   return (
-    <Modal title={`上传课堂 · ${target.course_name}`} onClose={onClose}
-      footer={<><button className="ghost" onClick={onClose}>取消</button><button className="primary" disabled={busy} onClick={submit}>{busy ? '处理中…' : '开始处理'}</button></>}>
-      <div className="muted small">日期 {target.date} · {target.start}–{target.end}</div>
-      <div className="row" style={{ margin: '12px 0' }}>
-        <button className={mode === 'audio' ? 'primary' : ''} onClick={() => setMode('audio')}>上传录音</button>
-        <button className={mode === 'text' ? 'primary' : ''} onClick={() => setMode('text')}>导入转写文字</button>
-      </div>
-      {mode === 'audio' ? (
-        <div className="drop-zone">
-          <b>{file ? file.name : '选择课堂录音'}</b>
-          <span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : '支持 MP3、M4A、WAV、AAC、FLAC、OGG、MP4'}</span>
-          <input type="file" accept=".mp3,.m4a,.wav,.aac,.flac,.ogg,.mp4" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+    <div className="agenda-page">
+      <header className="agenda-header">
+        <div>
+          <div className="agenda-term">{semName}</div>
+          <h1 className="agenda-title">{selectedDay?.is_today ? '今天' : selectedDay?.weekday_cn || '本周'}</h1>
+          {selectedDay && <p className="agenda-date">{selectedDay.date}</p>}
         </div>
-      ) : (
-        <>
-          <label>语言</label>
-          <select value={lang} onChange={(e) => setLang(e.target.value)}>
-            <option value="zh">中文</option><option value="en">英文</option><option value="auto">自动</option>
-          </select>
-          <label>转写文字（支持 [mm:ss] 时间戳）</label>
-          <textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="粘贴真实课堂转写；有时间戳也可以一并粘贴。" />
-        </>
+        <div className="agenda-week-nav" aria-label="周切换">
+          <button className="icon-button" type="button" aria-label="上一周" onClick={() => shiftWeek(-7)}>‹</button>
+          <span>{week.length ? `${week[0].date.slice(5)} — ${week[week.length - 1].date.slice(5)}` : ''}</span>
+          <button className="icon-button" type="button" aria-label="下一周" onClick={() => shiftWeek(7)}>›</button>
+          {!isCurrentWeek && <button className="text-button" type="button" onClick={() => { setCenter(localDateISO()); setSelectedDate(localDateISO()); }}>本周</button>}
+        </div>
+      </header>
+
+      <nav className="agenda-date-strip" aria-label="选择日期">
+        {week.map((day) => (
+          <button key={day.date} type="button" className={`agenda-date-chip ${selectedDay?.date === day.date ? 'active' : ''}`}
+            aria-pressed={selectedDay?.date === day.date} onClick={() => setSelectedDate(day.date)}>
+            <span>{day.weekday_cn}</span><b>{day.date.slice(-2)}</b>
+          </button>
+        ))}
+      </nav>
+
+      {weekHint && <div className="small muted agenda-hint">{weekHint}</div>}
+      {loading ? <div className="empty">正在读取课表…</div> : (
+        <div className="agenda-layout">
+          <main className="agenda-main">
+            <div className="agenda-section-head">
+              <h2>课程安排</h2>
+              <span>{selectedDay?.slots.length || 0} 节</span>
+            </div>
+            {!selectedDay?.slots.length ? (
+              <div className="agenda-no-classes">这一天没有安排课程</div>
+            ) : selectedDay.slots.map((occ, index) => (
+              <article className={`agenda-class ${index === 0 ? 'featured' : ''}`} key={`${occ.course_id}-${occ.start_time}`}>
+                <div className="agenda-class-info">
+                  <div className="agenda-class-time">{occ.start_time}–{occ.end_time}</div>
+                  <button className="agenda-course-name" type="button" onClick={() => openLesson(occ, selectedDay.date)}>{occ.course_name}</button>
+                  <div className="agenda-class-meta">
+                    {occ.location && <span>{occ.location}</span>}
+                    {occ.session && <StatusBadge status={occ.session.status} />}
+                  </div>
+                </div>
+                <div className="agenda-class-actions">
+                  <button className="primary" type="button" onClick={() => addAudio(occ, selectedDay.date, 'microphone')}>电脑录音</button>
+                  <button className="quiet-button" type="button" onClick={() => addAudio(occ, selectedDay.date, 'upload')}>导入录音</button>
+                </div>
+              </article>
+            ))}
+          </main>
+
+          <aside className="agenda-rail">
+            <div className="agenda-section-head"><h2>待处理</h2><span>{pending.length}</span></div>
+            {pending.length ? pending.map(({ day, occ }) => occ.session ? (
+              <button className="agenda-pending" type="button" key={occ.session.id}
+                onClick={() => navigate({ name: 'session', id: occ.session!.id })}>
+                <span className="agenda-pending-date">{day.date.slice(5)} · {occ.start_time}</span>
+                <strong>{occ.session.title || occ.course_name}</strong>
+                <StatusBadge status={occ.session.status} />
+              </button>
+            ) : null) : <div className="agenda-empty-pending">暂无待处理课堂</div>}
+          </aside>
+        </div>
       )}
-      {mode === 'audio' && <RecognitionSettings value={recognition.value} onChange={recognition.setValue} disabled={busy || !recognition.ready} />}
-      {recognition.error && <p role="alert">{recognition.error}</p>}
-      {msg && <div className="badge red" style={{ marginTop: 10 }}>{msg}</div>}
-    </Modal>
+    </div>
   );
 }

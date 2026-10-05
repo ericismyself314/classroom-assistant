@@ -22,6 +22,19 @@ def _same_note(a, b):
     return bool(norm(a)) and norm(a) == norm(b)
 
 
+def _evidence_excerpt(text, limit=280):
+    """Return a verifier-safe source excerpt from a coarse ASR segment."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    cut = max(value.rfind(mark, 0, limit) for mark in ("。", "！", "？", ".", "!", "?", "；", ";"))
+    if cut < limit // 2:
+        cut = limit
+    else:
+        cut += 1
+    return value[:cut].strip()
+
+
 def evidence_for(candidate, segments, offset=0):
     evidence = candidate.get("evidence")
     if evidence is None:
@@ -37,7 +50,8 @@ def evidence_for(candidate, segments, offset=0):
                 return None
             if not 0 <= index < len(segments):
                 return None
-            evidence.append({"segment_id": str(index + offset), "quote": segments[index]["text"]})
+            evidence.append({"segment_id": str(index + offset),
+                             "quote": _evidence_excerpt(segments[index]["text"])})
     if not isinstance(evidence, list) or not evidence:
         return None
     result = []

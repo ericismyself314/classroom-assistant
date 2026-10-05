@@ -120,7 +120,7 @@ async function rawUploadWithHeaders(path: string, file: File, extra: Record<stri
   try {
     const r = await fetchWithTimeout(path, {
       method: 'POST',
-      headers: { 'X-Filename': wireFilename(file.name), 'Content-Type': 'application/octet-stream', ...extra },
+      headers: { 'X-Filename': wireFilename(file.name), 'X-Original-Filename': encodeURIComponent(file.name), 'Content-Type': 'application/octet-stream', ...extra },
       body: buf,
     }, UPLOAD_TIMEOUT_MS);
     if (!r.ok) {
@@ -157,6 +157,7 @@ async function rawUploadWithProgress(
     xhr.timeout = UPLOAD_TIMEOUT_MS;
     xhr.responseType = 'text';
     xhr.setRequestHeader('X-Filename', wireFilename(file.name));
+    xhr.setRequestHeader('X-Original-Filename', encodeURIComponent(file.name));
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     for (const [k, v] of Object.entries(extra)) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => {
@@ -190,7 +191,7 @@ async function rawUploadWithProgress(
 }
 
 export const api = {
-  state: () => req('/api/state'),
+  state: (brief = false) => req('/api/state' + (brief ? '?brief=1' : '')),
   readiness: () => req('/api/readiness'),
   semesters: () => req('/api/semesters'),
   createSemester: (b: any) => req('/api/semesters', { method: 'POST', body: JSON.stringify(b) }),
@@ -211,8 +212,11 @@ export const api = {
   sessionJob: (id: string) => req(`/api/sessions/${id}/job`),
   deleteSession: (id: string) => req(`/api/sessions/${id}`, { method: 'DELETE' }),
 
-  uploadAudio: (id: string, file: File, onProgress?: (loaded: number, total: number) => void) =>
-    rawUploadWithProgress(`/api/sessions/${id}/audio`, file, {}, onProgress),
+  uploadAudio: (id: string, file: File, onProgress?: (loaded: number, total: number) => void,
+    extra?: Record<string, string>) =>
+    rawUploadWithProgress(`/api/sessions/${id}/audio`, file, extra || {}, onProgress),
+  deleteSessionAudio: (id: string) => req(`/api/sessions/${id}/audio`, { method: 'DELETE' }),
+  deleteStagedAudioFile: (id: string, index: number) => req(`/api/sessions/${id}/audio/${index}`, { method: 'DELETE' }),
   importTranscript: (id: string, b: any) => req(`/api/sessions/${id}/transcript`, { method: 'POST', body: JSON.stringify(b) }),
   process: (id: string, b: any) => req(`/api/sessions/${id}/process`, { method: 'POST', body: JSON.stringify(b) }),
 

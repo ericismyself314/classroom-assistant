@@ -4,8 +4,8 @@
 - 基础自检 `--self-test`：应用目录、数据目录可写、数据库打开与迁移、前端产物存在、
   后端启动 + /api/health 200（含端口绑定）、WebView2 状态、日志目录可写、模型目录、
   模型状态（仅报告）、GPU 信息。不依赖真实模型与 GUI。致命项失败 → 退出码 2。
-- 就绪检查 `--readiness-check`：在基础自检通过的前提下，对真实模型做
-  文件 + sha256 + 真实加载 + 真实转写（语音）/ 真实结构化分析（文字）+ 5 层证据关 +
+- 就绪检查 `--readiness-check`：在基础自检通过的前提下，验证 Qwen 语音模型完整并实际加载，
+  对文字模型执行真实结构化分析 + 5 层证据关 +
   落库 + 搜索命中；按退出码区分结果（0/10/11/12/13/20/21/22）。
 
 Settings / 首启向导复用同一份「就绪状态」：`/api/readiness` 与 `--readiness-check`
@@ -20,7 +20,6 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-import wave
 
 from . import config, db
 from .ai import llm_provider, manifest, whisper_worker
@@ -175,7 +174,7 @@ def run_self_test(fatal_on_missing_static: bool = False) -> dict:
         settings = db.get_all_settings()
         st = detect_status(settings)
         llm_dl = provider_is_ready(settings, st)
-        return True, f"whisper 已下载={ws}; llm 已下载={llm_dl}"
+        return True, f"Qwen3-ASR 已下载={ws}; 本地文字模型已下载={llm_dl}"
     checks.append(_check("模型状态", model_status, fatal=False))
 
     # 9. GPU 信息（非致命，仅报告）
@@ -217,7 +216,7 @@ def compute_readiness_state() -> dict:
         "llm_downloaded": llm_dl,
         "llm_model_label": current_llm["display"],
         "webview2": {"ok": wv_ok, "detail": wv_detail},
-        "gpu": whisper_worker.gpu_info(),
+        "gpu": whisper_worker.gpu_info(probe=False),
         "frontend_present": os.path.isfile(os.path.join(DIST_DIR, "index.html")),
         "data_dir": cfg.dirs.data_dir,
     }
@@ -242,24 +241,8 @@ def _sha256_of(path: str, limit: int = 0) -> str | None:
     return h.hexdigest()
 
 
-def _make_tone_sample(path: str, seconds: float = 3.0, hz: float = 220.0) -> str:
-    """生成一段纯音（非语音）样例，用于验证 VAD/静音不过度虚构。返回路径。"""
-    n = int(16000 * seconds)
-    with wave.open(path, "w") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        import math
-        import struct
-
-        for i in range(n):
-            v = int(8000 * math.sin(2 * math.pi * hz * i / 16000))
-            w.writeframes(struct.pack("<h", v))
-    return path
-
-
-def _check_whisper_ready(tmp: str, size: str | None = None) -> dict:
-    """真实加载 + 真实转写一段样例音频。返回 {ready, detail, file, sha256, loaded, transcribed, segments}。"""
+def _check_whisper_ready(size: str | None = None) -> dict:
+    """检查 Qwen3-ASR 模型文件并实际加载。返回 {ready, detail, file, sha256, loaded}。"""
     if not size:
         settings = db.get_all_settings()
         tier = settings.get("whisper_tier") or manifest.DEFAULT_WHISPER_TIER
@@ -271,63 +254,16 @@ def _check_whisper_ready(tmp: str, size: str | None = None) -> dict:
     if not whisper_worker.is_model_downloaded(size):
         res["detail"] = "语音模型未下载"
         return res
-    # 模型文件 sha256（只取缓存目录主模型文件）
     try:
-        import glob
-        cands = []
-        for cache_name in whisper_worker._repo_cache_names(size):
-            cands.extend(glob.glob(os.path.join(
-                whisper_worker.models_root(), cache_name, "**", "*.bin"),
-                recursive=True))
-        cands.sort()
-        if cands:
-            res["file"] = cands[0]
-            res["sha256"] = _sha256_of(cands[0], limit=1 << 26)
-    except Exception:  # noqa: BLE001
-        pass
-    # 真实加载
-    try:
-        from faster_whisper import WhisperModel
-
-        # 设备选择交给 whisper_worker 统一处理：用户偏好 → 实际可用。
-        # 之前这里写死 info["available"] → cuda 是 PyInstaller 打包后 fail 的根源。
         settings = db.get_all_settings()
-        pref = (settings.get("whisper_device") or "auto").lower()
-        plan = whisper_worker.resolve_device(pref)
-        device = plan["device"]
-        compute_type = "float16" if device == "cuda" else "int8"
-        os.environ.setdefault("HF_HOME", whisper_worker._cache_dir())
-        model = WhisperModel(size, device=device, compute_type=compute_type,
-                             download_root=whisper_worker.models_root(),
-                             num_workers=2)
+        ready = whisper_worker.ensure_ready(settings.get("whisper_device") or "auto")
         res["loaded"] = True
-    except Exception as e:  # noqa: BLE001
-        res["detail"] = f"语音模型加载失败: {e}"
-        return res
-    # 真实转写（纯音样例：验证 VAD 不过度虚构）
-    sample = os.path.join(tmp, "readiness_tone.wav")
-    _make_tone_sample(sample, seconds=3.0)
-    try:
-        segs, _lang, _device = whisper_worker.transcribe(sample, size=size, language=None)
-        res["transcribed"] = True
-        res["segments"] = len(segs)
-        total_chars = sum(len(s.get("text", "")) for s in segs)
-        # 纯音不应产生大量虚构文字
-        if total_chars > 200:
-            res["detail"] = f"转写产出异常多文字（{total_chars} 字），疑似静音虚构"
-            return res
         res["ready"] = True
-        res["detail"] = f"加载成功（{device}/{compute_type}）；转写 {len(segs)} 段，{total_chars} 字（静音未虚构）"
+        res["detail"] = f"Qwen3-ASR 加载成功（{ready['device']}）"
+        return res
     except Exception as e:  # noqa: BLE001
-        # 纯音被 VAD 正确过滤时，正式转写入口会用这条提示结束；这恰好证明
-        # 模型已完成加载和推理，而不是测试失败。
-        if "没有识别到清晰的人声" in str(e):
-            res["transcribed"] = True
-            res["ready"] = True
-            res["detail"] = f"加载与推理成功（{device}/{compute_type}）；测试纯音未产生虚构文字"
-        else:
-            res["detail"] = f"语音转写失败: {e}"
-    return res
+        res["detail"] = f"Qwen3-ASR 加载失败: {e}"
+        return res
 
 
 def _check_llm_ready(tmp: str) -> dict:
@@ -452,7 +388,7 @@ def run_readiness_check(fatal_on_missing_static: bool = False) -> dict:
     gpu = whisper_worker.gpu_info()
 
     tmp = tempfile.mkdtemp(prefix="ca_readiness_")
-    wres = _check_whisper_ready(tmp)
+    wres = _check_whisper_ready()
     lres = _check_llm_ready(tmp)
 
     whisper_missing = not wres["ready"] and "未下载" in wres["detail"]

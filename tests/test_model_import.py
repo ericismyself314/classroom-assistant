@@ -74,7 +74,7 @@ def test_import_raw_gguf(tmp_path):
     gguf = b"\x00GGUF" + b"x" * 64
     llm_dir = tmp_path / "llm"
     res = mi.import_model_archive(gguf, model_type="llm", model_id="qwen2.5",
-                                  llm_models_dir=str(llm_dir), whisper_models_dir=str(tmp_path / "wh"))
+                                  llm_models_dir=str(llm_dir))
     assert res["type"] == "llm"
     out = llm_dir / "qwen2.5.gguf"
     assert out.exists() and out.read_bytes() == gguf
@@ -85,27 +85,26 @@ def test_import_gguf_in_zip(tmp_path):
     z = _make_zip({"some/sub/model.gguf": gguf, "readme.txt": b"note"})
     llm_dir = tmp_path / "llm"
     res = mi.import_model_archive(z, model_type="auto", model_id="qwen2.5",
-                                 llm_models_dir=str(llm_dir), whisper_models_dir=str(tmp_path / "wh"))
+                                 llm_models_dir=str(llm_dir))
     assert res["type"] == "llm"
     out = llm_dir / "qwen2.5.gguf"
     assert out.exists() and out.read_bytes() == gguf
 
 
-def test_import_whisper_zip(tmp_path):
-    z = _make_zip({"models--Systran--faster-whisper-base/snapshots/abc/model.bin": b"W"})
-    wh_dir = tmp_path / "whisper_models"
-    res = mi.import_model_archive(z, model_type="whisper", model_id="base",
-                                  llm_models_dir=str(tmp_path / "llm"),
-                                  whisper_models_dir=str(wh_dir))
-    assert res["type"] == "whisper"
-    assert (wh_dir / "models--Systran--faster-whisper-base" / "snapshots" / "abc" / "model.bin").exists()
+def test_import_whisper_zip_rejected(tmp_path):
+    z = _make_zip({"legacy-speech/snapshots/abc/model.bin": b"W"})
+    try:
+        mi.import_model_archive(z, model_type="whisper", model_id="legacy",
+                                llm_models_dir=str(tmp_path / "llm"))
+        assert False, "旧语音模型导入应被拒绝"
+    except ValueError as exc:
+        assert "Qwen3-ASR-0.6B" in str(exc)
 
 
 def test_import_empty_rejected(tmp_path):
     try:
         mi.import_model_archive(b"", model_type="auto", model_id="x",
-                                llm_models_dir=str(tmp_path / "l"),
-                                whisper_models_dir=str(tmp_path / "w"))
+                                llm_models_dir=str(tmp_path / "l"))
         assert False
     except ValueError:
         pass

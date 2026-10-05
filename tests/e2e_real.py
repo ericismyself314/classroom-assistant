@@ -3,7 +3,7 @@
 用法：
   python tests/e2e_real.py <一段有清晰人声的音频>
 
-实际经过：音频文件 -> faster-whisper -> llama.cpp/Qwen -> 五层证据核查
+实际经过：音频文件 -> Qwen3-ASR -> llama.cpp/Qwen -> 五层证据核查
           -> SQLite -> 结果回读。数据库使用独立临时目录，模型沿用当前用户目录。
 """
 from __future__ import annotations

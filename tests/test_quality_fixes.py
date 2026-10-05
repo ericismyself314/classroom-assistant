@@ -17,6 +17,22 @@ class Reply:
     def chat(self, *a, **k): return json.dumps(self.response, ensure_ascii=False)
 
 
+import re as _re
+
+class ChunkDroppingReply:
+    """模拟本地小模型：多段整块翻译时漏掉最后一条，但逐段补翻时能翻出。"""
+    def chat(self, system, user, json_mode=False, temperature=0):
+        idxs = [int(m) for m in _re.findall(r'\[(\d+)\]', user)]
+        keep = idxs[:1] if len(idxs) > 1 else idxs
+        translations = [{'index': i, 'text': f'中文{i}'} for i in keep]
+        return json.dumps({'translations': translations}, ensure_ascii=False)
+
+
+class EmptyReply:
+    """模拟模型完全翻不出任何内容。"""
+    def chat(self, *a, **k): return json.dumps({'translations': []}, ensure_ascii=False)
+
+
 def test_english_transcript_gets_chinese_display_without_overwriting_source():
     source = [seg('The final exam is next Friday.'), seg('Please submit the report online.', 1)]
     reply = Reply({'translations': [
@@ -27,6 +43,35 @@ def test_english_transcript_gets_chinese_display_without_overwriting_source():
     assert source[0]['text'] == 'The final exam is next Friday.'
     assert [s['text'] for s in display] == ['期末考试在下周五举行。', '请在线提交报告。']
     assert [s['display_text'] for s in display] == ['期末考试在下周五举行。', '请在线提交报告。']
+
+
+def test_incomplete_chunk_translates_all_via_per_segment_retry():
+    # 本地模型整块翻译漏掉一条，但逐段补翻能翻出 -> 整节课不再因少一条而失败。
+    source = [seg('The final exam is next Friday.'), seg('Please submit the report online.', 1)]
+    display = segment_analysis.translate_for_display(ChunkDroppingReply(), source, {'transcript_language': 'en'})
+    assert source[0]['text'] == 'The final exam is next Friday.'          # 原始 ASR 不被覆盖
+    assert display[0]['display_text'] is not None
+    assert display[1]['display_text'] is not None                          # 逐段补翻补齐
+    assert display[1]['text'] == display[1]['display_text']               # 展示中文
+
+
+def test_untranslatable_segment_falls_back_to_english():
+    # 真正翻不出时，仅该段回退英文原文（display_text=None），其余段不受影响、整节课不报错。
+    source = [seg('The final exam is next Friday.'), seg('Please submit the report online.', 1)]
+    display = segment_analysis.translate_for_display(EmptyReply(), source, {'transcript_language': 'en'})
+    assert display[0]['text'] == source[0]['text']
+    assert display[0]['display_text'] is None
+    assert display[1]['display_text'] is None
+
+
+def test_qwen_coarse_result_is_split_for_translation_and_evidence():
+    text = ("This is a complete classroom sentence. " * 30).strip()
+    parts = whisper_worker.split_qwen_segment(text, 0, 120)
+    assert len(parts) > 1
+    assert all(0 < len(part['text']) <= 240 for part in parts)
+    assert parts[0]['start_seconds'] == 0
+    assert parts[-1]['end_seconds'] == 120
+    assert all(a['end_seconds'] <= b['start_seconds'] for a, b in zip(parts, parts[1:]))
 
 
 def test_display_text_is_persisted_separately_from_asr_source():

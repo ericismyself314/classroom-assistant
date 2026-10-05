@@ -90,6 +90,15 @@ def test_prompts_have_no_factual_example():
     prompt = prompts.SYSTEM_ANALYZER.format(class_date='2026-09-01')
     assert '消费者' not in prompt and '第二次作业' not in prompt and '{{' not in prompt
 
+def test_legacy_long_qwen_evidence_is_bounded():
+    text = "课堂原文很长。" * 100
+    evidence = q.evidence_for(
+        {"evidence_segment_ids": [0]},
+        [{"text": text, "start_seconds": 0, "end_seconds": 120}],
+    )
+    assert evidence and 4 <= len(evidence[0]["quote"]) <= 300
+    assert evidence[0]["quote"] in text
+
 if __name__ == '__main__':
     for name, fn in list(globals().items()):
         if name.startswith('test_'):

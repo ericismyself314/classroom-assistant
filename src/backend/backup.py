@@ -140,6 +140,8 @@ def restore_backup(zip_path: str) -> dict:
                 ignore = shutil.ignore_patterns("*-shm", "*-wal", "*-journal") if sub == "database" else None
                 shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore)
 
+    # 旧备份可能没有新版本字段；先跑迁移，再重建搜索索引。
+    db.init_db()
     db.rebuild_fts()
     LOG.info("备份恢复完成: %s", zip_path)
     return {"restored": zip_path, "snapshot": snap_dir}

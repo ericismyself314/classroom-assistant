@@ -6,11 +6,10 @@
 - 按内容分流：
   * zip 内含 .gguf  -> 当作 LLM 模型，落到 llm_models/<model_id>.gguf；
   * 单独的 .gguf   -> 同上（直接写盘，无需解压）；
-  * whisper 模型目录 -> 解压到 whisper 缓存的 models/ 下，保留原有目录结构。
+  * 语音模型不提供手动导入：应用只支持从设置页下载并校验官方 Qwen3-ASR-0.6B。
 
-说明：whisper 的 faster-whisper 期望 HuggingFace 缓存布局
-（models--Systran--faster-whisper-<size>/snapshots/<hash>/...），手动导入时
-用户需保证 zip 内结构与该布局一致；本模块只负责“安全落地”，不做格式转换。
+说明：文字模型导入仍会经过严格的路径安全检查；语音模型统一走 Qwen 下载流程，
+避免把旧版或不兼容的语音模型写入本机。
 """
 from __future__ import annotations
 
@@ -60,15 +59,18 @@ def _is_zip(data: bytes) -> bool:
 
 
 def import_model_archive(data: bytes, *, model_type: str, model_id: str,
-                          llm_models_dir: str, whisper_models_dir: str) -> dict:
+                          llm_models_dir: str) -> dict:
     """导入模型档案。
 
-    model_type: 'auto' | 'llm' | 'whisper'
+    model_type: 'auto' | 'llm'
     model_id:   LLM 导入时的目标模型 id（用于文件名 <id>.gguf）
     返回 {type, files, dest}
     """
     if not data:
         raise ValueError("空文件")
+
+    if model_type == "whisper":
+        raise ValueError("语音模型只支持 Qwen3-ASR-0.6B，请在设置页下载并校验")
 
     if not _is_zip(data):
         # 单独 .gguf 直传
@@ -87,7 +89,9 @@ def import_model_archive(data: bytes, *, model_type: str, model_id: str,
         has_gguf = any(n.lower().endswith(".gguf") for n in names)
 
         if model_type == "auto":
-            model_type = "llm" if has_gguf else "whisper"
+            if not has_gguf:
+                raise ValueError("不支持导入语音模型；请在设置页下载 Qwen3-ASR-0.6B")
+            model_type = "llm"
 
         if model_type == "llm":
             # 仅取 .gguf，安全解压后合并为单个 <id>.gguf
@@ -112,11 +116,7 @@ def import_model_archive(data: bytes, *, model_type: str, model_id: str,
             LOG.info("导入 LLM 模型(zip): %s", dest)
             return {"type": "llm", "files": [dest], "dest": dest}
 
-        # whisper：整体安全解压到缓存 models/
-        dest = whisper_models_dir
-        extracted = safe_extract_zip(zf, dest)
-        LOG.info("导入 whisper 模型(zip): %d 个成员 -> %s", len(extracted), dest)
-        return {"type": "whisper", "files": extracted, "dest": dest}
+        raise ValueError("语音模型只支持 Qwen3-ASR-0.6B，请在设置页下载并校验")
 
 
 def _member_size(zf: zipfile.ZipFile, name: str) -> int:

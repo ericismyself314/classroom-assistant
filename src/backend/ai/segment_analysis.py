@@ -48,12 +48,108 @@ def _translation_rows(raw) -> dict[int, str] | None:
     return result or None
 
 
+def _single_translation_text(data) -> str | None:
+    """从（可能不完整的）模型响应里取第一条非空翻译文字，忽略编号。"""
+    if isinstance(data, dict):
+        tr = data.get("translations")
+        if isinstance(tr, list):
+            for row in tr:
+                if isinstance(row, dict) and str(row.get("text") or "").strip():
+                    return str(row["text"]).strip()
+    return None
+
+
+def _translate_chunk(provider, chunk: list[dict], offset: int, retries: int = 2) -> dict[int, str]:
+    """翻译一个块，返回 {全局编号: 中文}。整块都翻不出时返回 {}。
+
+    本地小模型（如 Qwen3-4B）翻译大段经常丢条目或返回截断 JSON。这里整块重试几次；
+    仍缺失的片段交给调用方逐段补翻，因此「一个块失败」绝不会拖累整节课。
+    """
+    for attempt in range(retries):
+        try:
+            response = provider.chat(
+                prompts.TRANSLATION_SYSTEM,
+                prompts.TRANSLATION_PROMPT.format(segments=_fmt_segments(chunk, offset)),
+                json_mode=True,
+                temperature=0,
+            )
+            rows = _translation_rows(schemas._extract_json(response))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("中文展示稿整块翻译调用失败（尝试 %d/%d）offset=%d: %s",
+                        attempt + 1, retries, offset, exc)
+            continue
+        if rows:
+            expected = set(range(offset, offset + len(chunk)))
+            valid = {i: t for i, t in rows.items() if i in expected and str(t).strip()}
+            if valid:
+                return valid
+            LOG.warning("中文展示稿整块翻译返回不完整（尝试 %d/%d）offset=%d，转交逐段补翻",
+                        attempt + 1, retries, offset)
+        else:
+            LOG.warning("中文展示稿整块翻译无法解析（尝试 %d/%d）offset=%d", attempt + 1, retries, offset)
+    return {}
+
+
+def _translate_one_short(provider, segment: dict, global_index: int, retries: int = 3) -> str | None:
+    """翻译单个片段。小模型对单段最稳，用于补翻整块翻译漏掉的条目。"""
+    line = _fmt_segments([segment], global_index)
+    for attempt in range(retries):
+        try:
+            response = provider.chat(
+                prompts.TRANSLATION_SYSTEM,
+                prompts.TRANSLATION_PROMPT.format(segments=line),
+                json_mode=True,
+                temperature=0,
+            )
+            text = _single_translation_text(schemas._extract_json(response))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("单段翻译调用失败（尝试 %d/%d）seg=%d: %s", attempt + 1, retries, global_index, exc)
+            continue
+        if text:
+            return text
+    return None
+
+
+def _translation_parts(text: str, max_chars: int = 260) -> list[str]:
+    """Split legacy coarse ASR text before sending it to the small local LLM."""
+    value = str(text or "").strip()
+    parts = []
+    while len(value) > max_chars:
+        cut = max(value.rfind(mark, 0, max_chars) for mark in
+                  ("。", "！", "？", ".", "!", "?", "；", ";", "，", ",", " "))
+        if cut < max_chars // 2:
+            cut = max_chars
+        else:
+            cut += 1
+        parts.append(value[:cut].strip())
+        value = value[cut:].strip()
+    if value:
+        parts.append(value)
+    return parts
+
+
+def _translate_one(provider, segment: dict, global_index: int, retries: int = 3) -> str | None:
+    """Translate one source segment, including old oversized Qwen segments."""
+    parts = _translation_parts(segment.get("text", ""))
+    translated = []
+    for part in parts:
+        text = _translate_one_short(provider, {**segment, "text": part}, global_index, retries)
+        if not text:
+            return None
+        translated.append(text)
+    return "".join(translated) if translated else None
+
+
 def translate_for_display(provider, segments: list[dict], session_meta: dict, progress_cb=None) -> list[dict]:
     """Return Chinese display copies without overwriting the ASR source text.
 
     ``text`` remains the recoverable original in SQLite. The returned copies use
     Chinese text so every derived note, source quote, and uncertainty card is
     readable in Chinese as well.
+
+    稳定性：本地小模型翻译大段时常丢条目或返回截断 JSON。这里逐块翻译、单块失败
+    不中断整轮；每块缺失的片段再逐段补翻，只有真正翻不出的才回退英文原文
+    （display_text=None），绝不再因「少一条」就让整节课失败。
     """
     if not segments:
         return []
@@ -62,31 +158,36 @@ def translate_for_display(provider, segments: list[dict], session_meta: dict, pr
     if provider is None:
         raise RuntimeError("英文转写需要可用的本地文字模型来生成中文展示稿")
 
+    total = len(segments)
     translated: dict[int, str] = {}
     chunks = split_segments(segments, max_chars=2600)
     offset = 0
     for ci, chunk in enumerate(chunks):
         if progress_cb:
             progress_cb("翻译为中文展示稿", ci / max(len(chunks), 1))
-        response = provider.chat(
-            prompts.TRANSLATION_SYSTEM,
-            prompts.TRANSLATION_PROMPT.format(segments=_fmt_segments(chunk, offset)),
-            json_mode=True,
-            temperature=0,
-        )
-        rows = _translation_rows(schemas._extract_json(response))
-        expected = set(range(offset, offset + len(chunk)))
-        if rows is None or not expected.issubset(rows):
-            raise RuntimeError("中文展示稿生成不完整；已保留英文原文，请稍后仅重新分析重试")
-        translated.update({i: rows[i] for i in expected})
+        rows = _translate_chunk(provider, chunk, offset)
+        translated.update(rows)
+        # 逐段补翻本块仍缺失的片段（小模型对单段最稳）
+        for i in range(offset, offset + len(chunk)):
+            if i not in translated:
+                t = _translate_one(provider, segments[i], i)
+                if t:
+                    translated[i] = t
         offset += len(chunk)
 
     out = []
+    fallback_count = 0
     for i, segment in enumerate(segments):
         display = translated.get(i)
-        if not display:
-            raise RuntimeError("中文展示稿生成不完整；已保留英文原文，请稍后仅重新分析重试")
-        out.append({**segment, "display_text": display, "text": display})
+        if display:
+            out.append({**segment, "display_text": display, "text": display})
+        else:
+            fallback_count += 1
+            # display_text=None 让界面明确回退到可核对的 ASR 原文，且不会把英文误标成中文译文。
+            out.append({**segment, "display_text": None, "text": segment.get("text", "")})
+    if fallback_count:
+        LOG.warning("中文展示稿采用英文原文兜底：translated=%d fallback=%d total=%d",
+                    len(translated), fallback_count, total)
     if progress_cb:
         progress_cb("翻译为中文展示稿", 1.0)
     return out
