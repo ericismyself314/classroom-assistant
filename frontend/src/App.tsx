@@ -20,11 +20,11 @@ export type View =
   | { name: 'settings' };
 
 const NAV = [
-  { key: 'week', label: '本周', icon: 'calendar' },
+  { key: 'week', label: '今天', icon: 'calendar' },
   { key: 'audio', label: '录音与导入', icon: 'microphone' },
   { key: 'courses', label: '课程', icon: 'book' },
-  { key: 'important', label: '重要事项', icon: 'bookmark' },
-  { key: 'search', label: '搜索', icon: 'search' },
+  { key: 'important', label: '我的待办', icon: 'bookmark' },
+  { key: 'search', label: '搜索笔记', icon: 'search' },
   { key: 'settings', label: '设置', icon: 'settings' },
 ] as const;
 
