@@ -4,7 +4,7 @@
 
 ## 下载与首次使用
 
-从 [GitHub Releases](https://github.com/ericismyself314/classroom-assistant/releases/latest) 下载 `ClassroomAssistant-3.0.0-win-x64-portable.zip`，解压整个压缩包后运行 `ClassroomAssistant.exe`。请保留旁边的 `_internal` 文件夹。
+从 [GitHub Releases](https://github.com/ericismyself314/classroom-assistant/releases/latest) 下载 `ClassroomAssistant-3.0.1-win-x64-portable.zip`，解压整个压缩包后运行 `ClassroomAssistant.exe`。请保留旁边的 `_internal` 文件夹。
 
 第一次使用需要联网并准备模型，预留约 2–5 GB 空间：
 
@@ -34,4 +34,4 @@
 
 ## 发布说明与许可
 
-3.0.0 的变化见 [`CHANGELOG.md`](CHANGELOG.md)。本项目采用 MIT License；第三方模型、运行库及依赖遵循各自许可证。
+3.0.1 的变化见 [`CHANGELOG.md`](CHANGELOG.md)。本项目采用 MIT License；第三方模型、运行库及依赖遵循各自许可证。

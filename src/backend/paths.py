@@ -88,7 +88,20 @@ class DataDirs:
         return os.path.join(self.database, "classroom-assistant.db")
 
     def audio_dir_for(self, semester_id: str, course_id: str, session_id: str) -> str:
-        d = os.path.join(self.audio, semester_id, course_id, session_id)
+        # UUID-backed database ids are already unique, but writing all three full
+        # values into the directory hierarchy can exceed Windows' legacy MAX_PATH
+        # limit when the user chooses a deep data directory. Keep enough entropy
+        # for collision resistance while leaving room for generated filenames.
+        def compact_id(value: str) -> str:
+            token = value.rsplit("_", 1)[-1]
+            return token[:16]
+
+        d = os.path.join(
+            self.audio,
+            compact_id(semester_id),
+            compact_id(course_id),
+            compact_id(session_id),
+        )
         os.makedirs(d, exist_ok=True)
         return d
 
