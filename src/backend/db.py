@@ -734,6 +734,29 @@ def replace_items(session_id, items: list[dict]) -> None:
             )
 
 
+def dashboard_overview(semester_id: str) -> dict:
+    """Bounded, lightweight dashboard data; exclude archived/other-semester courses."""
+    conn = read_conn()
+    recent = conn.execute(
+        "SELECT cs.id, cs.course_id, cs.title, cs.session_date, cs.location, "
+        "cs.status, cs.audio_path, cs.audio_duration_seconds, c.name AS course_name "
+        "FROM class_sessions cs JOIN courses c ON c.id=cs.course_id "
+        "WHERE c.semester_id=? AND c.is_archived=0 "
+        "ORDER BY cs.session_date DESC, cs.created_at DESC, cs.id DESC LIMIT 3",
+        (semester_id,),
+    ).fetchall()
+    items = conn.execute(
+        "SELECT i.*, cs.session_date FROM important_items i "
+        "JOIN courses c ON c.id=i.course_id "
+        "JOIN class_sessions cs ON cs.id=i.session_id "
+        "WHERE c.semester_id=? AND c.is_archived=0 AND i.is_completed=0 "
+        "AND i.action_required=1 AND i.verification_status != 'rejected' "
+        "ORDER BY CASE WHEN i.normalized_date IS NULL OR i.normalized_date='' THEN 1 ELSE 0 END, "
+        "i.normalized_date, i.created_at DESC LIMIT 3", (semester_id,),
+    ).fetchall()
+    return {"recent_sessions": [dict(row) for row in recent], "items": [dict(row) for row in items]}
+
+
 def list_items(filters: dict | None = None) -> list[dict]:
     # 联表 class_sessions 取出 session_date，供前端“课程 · 日期”展示（不删功能）
     sql = (

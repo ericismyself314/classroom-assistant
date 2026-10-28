@@ -3,6 +3,7 @@ import { api } from '../api';
 import { Session, Segment, Topic, Item, AudioFile, CATEGORY_LABELS, CONFIDENCE_LABELS } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { AudioPlayer } from '../components/AudioPlayer';
+import { Icon } from '../components/Icon';
 import { Modal } from '../components/Modal';
 import { View } from '../App';
 import { ClassNotes, ReviewNotes, Sources } from '../components/ClassNotes';
@@ -29,6 +30,8 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
   const [history, setHistory] = useState<any>(null);
   const [err, setErr] = useState('');
   const [find, setFind] = useState('');
+  const [activeTab, setActiveTab] = useState('overview');
+  const [fileSignal, setFileSignal] = useState<{ index: number } | null>(null);
   const [editingSegment, setEditingSegment] = useState<Segment | null>(null);
   const [editingChapter, setEditingChapter] = useState<number | null>(null);
 
@@ -113,19 +116,29 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
 
   return (
     <div className="session-notes">
+      <button className="text-button session-breadcrumb" onClick={() => navigate({ name: 'courses', courseId: course.id })}>我的课程<Icon name="chevron" width="13" />{course.name}</button>
       <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
         <div>
           <div className="title-line"><h1 className="page-title">{sessionDisplayTitle}</h1>
             <button className="ghost title-edit" disabled={processing} onClick={renameTitle}>改标题</button></div>
           <p className="page-sub">
-            {session.session_date}{session.week_number ? ` · 第${session.week_number}周` : ''} · {session.start_time || ''}–{session.end_time || ''} · <StatusBadge status={session.status} />
+            {session.session_date}{session.week_number ? ` · 第${session.week_number}周` : ''}{session.start_time && session.end_time ? ` · ${session.start_time}—${session.end_time}` : ''} · <StatusBadge status={session.status} />
             {(duration || session.audio_duration_seconds) ? ` · 录音 ${fmt(duration || session.audio_duration_seconds)}` : ''}
           </p>
         </div>
-        <div className="row">
+        <div className="row session-header-actions">
+          <button disabled={processing || wrongLanguage || !segments.length} onClick={() => reprocess('analyze')}>重新分析</button>
+          <button onClick={() => {
+            const chapters = data.notes?.knowledge || data.notes?.chapters || [];
+            const text = [sessionDisplayTitle, session.session_date, ...chapters.flatMap((c: any) => [c.title, c.summary, ...(c.points || []).map((p: any) => typeof p === 'string' ? p : p.text)]), ...segments.map(s => presentationText(s))].filter(Boolean).join('\n\n');
+            const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+            const link = document.createElement('a'); link.href = url; link.download = `${sessionDisplayTitle.replace(/[<>:"/\\|?*]/g, '_')}.txt`; link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+          }}><Icon name="download" />导出</button>
+          <details className="session-menu"><summary>更多操作</summary><div>
           <button onClick={() => setRecognitionOpen(true)} disabled={processing}>识别设置{session.audio_path ? ' / 重新转写' : ''}</button>
           <button onClick={() => reprocess('analyze')} disabled={processing || wrongLanguage || !segments.length}>仅重新分析</button>
-          <button className="danger" onClick={del} disabled={processing}>删除</button>
+          <button className="danger" onClick={del} disabled={processing}>删除课堂</button>
+          </div></details>
         </div>
       </div>
 
@@ -171,54 +184,29 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
         </div>)}
       </div>}
 
-      <div className="session-audio-heading"><h2>本节录音</h2></div>
-      <div className="session-audio-actions">
-        <section className="card session-audio-card session-record-card">
-          <div className="session-media-head">
-            <span className="session-media-icon record-icon" aria-hidden="true">录</span>
-            <div><span className="audio-eyebrow">新增录音</span><h2>电脑录音 / 上传</h2></div>
-          </div>
-          <div className="session-recording-buttons">
-            <button className="primary" disabled={processing} onClick={() => openAudioWorkspace('microphone')}>电脑麦克风录音</button>
-            <button className="ghost" disabled={processing} onClick={() => openAudioWorkspace('upload')}>上传已有录音</button>
-          </div>
-        </section>
-
-        <section className="card session-audio-card session-play-card">
-          <div className="session-media-head">
-            <span className="session-media-icon play-icon" aria-hidden="true">听</span>
-            <div><span className="audio-eyebrow">回听已保存内容</span><h2>播放录音</h2></div>
-          </div>
-          {session.audio_path ? <AudioPlayer sessionId={sid} files={audio_files} seekSignal={seek}
-            onDuration={!audio_files || audio_files.length <= 1 ? setDuration : undefined} />
-            : <div className="session-playback-empty">
-              <span className="session-playback-symbol" aria-hidden="true">♫</span>
-              <b>本节还没有录音</b><span className="small muted">录制或上传后，可在这里播放和核对。</span>
-            </div>}
-        </section>
-      </div>
-      {session.audio_path && session.status === 'completed' && segments.length > 0 && <div className="audio-retention card">
-        <div>
-          <b>转写文字会保留</b>
-          <div className="small muted" style={{ marginTop: 3 }}>仅删除课堂助手内部的录音文件，完整转写、中文整理和总结会保留；另存到其他文件夹的副本仍在原处。</div>
+      {session.audio_path && <section className="glass-panel session-player-panel" aria-label="本节录音">
+        <AudioPlayer sessionId={sid} files={audio_files} seekSignal={seek} fileSignal={fileSignal} onDuration={!audio_files || audio_files.length <= 1 ? setDuration : undefined} />
+      </section>}
+      <details className="session-recording-tools">
+        <summary>{session.audio_path ? '添加与管理录音' : '本节尚无录音 · 添加录音'}</summary>
+        <div className="row wrap">
+          <button disabled={processing} onClick={() => openAudioWorkspace('microphone')}><Icon name="mic" />电脑录音</button>
+          <button disabled={processing} onClick={() => openAudioWorkspace('upload')}><Icon name="upload" />上传录音</button>
+          {session.audio_path && session.status === 'completed' && segments.length > 0 && <button className="ghost danger" disabled={processing || deletingAudio} onClick={deleteAudio}>{deletingAudio ? '正在删除…' : '删除录音，保留文字'}</button>}
         </div>
-        <button className="ghost danger" disabled={processing || deletingAudio} onClick={deleteAudio}>{deletingAudio ? '正在删除…' : '删除录音，保留文字'}</button>
-      </div>}
+      </details>
 
-      <ClassNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} processing={processing} onEdit={setEditingChapter}
-        beforeKnowledge={<>
-          <div className="section-heading"><h2>非知识点内容</h2><span className="small muted">老师提到的作业、考试、通知与安排</span></div>
-          {!wrongLanguage && <ItemsBlock items={confirmed} segments={segments} onChange={load} onSeek={jump} teacherVoice />}
-        </>} />
-      {!data.notes && topics.length > 0 && <details className="legacy-notes"><summary>查看旧版总结 · 未按新规则核对</summary>
-        {topics.map(t => <div className="topic" key={t.id}><b>{displayTitle(t.title, chineseEvidence(t, segments))}</b><p>{displaySummary(t.summary, chineseEvidence(t, segments))}</p></div>)}
-      </details>}
-
-      <div className="section-heading"><h2>待核对</h2><span className="small muted">不把听不清、含义不明的内容当成结论</span></div>
-      <ItemsBlock items={wrongLanguage ? items : pending} segments={segments} onChange={load} onSeek={jump} />
-      <ReviewNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} />
-
-      <details className="transcript-fold">
+      <div className="session-reading-grid">
+        <section className="glass-panel session-reading-pane">
+          <div className="segmented reading-tabs" role="group" aria-label="课堂内容">
+            {[['overview', '课堂概览'], ['transcript', '转写原文'], ['items', '重要事项'], ['review', '待核对']].map(([key, label]) => <button key={key} aria-pressed={activeTab === key} className={activeTab === key ? 'active' : ''} onClick={() => setActiveTab(key)}>{label}</button>)}
+          </div>
+          <div hidden={activeTab !== 'overview'}>
+            <ClassNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} processing={processing} onEdit={setEditingChapter} hideTimeline />
+            {!data.notes && topics.length > 0 && <details className="legacy-notes"><summary>旧版总结</summary>{topics.map(t => <div className="topic" key={t.id}><b>{displayTitle(t.title, chineseEvidence(t, segments))}</b><p>{displaySummary(t.summary, chineseEvidence(t, segments))}</p></div>)}</details>}
+          </div>
+          <div hidden={activeTab !== 'transcript'}>
+      <details className="transcript-fold" open>
       <summary>完整转写 <span className="small muted">{segments.length} 段 · 点击展开与搜索</span></summary>
       <div className="row" style={{ justifyContent: 'space-between', marginTop: 16 }}>
         <h3 style={{ margin: 0 }}>完整转写</h3>
@@ -239,6 +227,31 @@ export function SessionDetail({ sid, navigate }: { sid: string; navigate: (v: Vi
         ))}
       </div>
       </details>
+          </div>
+          <div hidden={activeTab !== 'items'}><h2 className="reading-section-title">重要事项</h2><ItemsBlock items={wrongLanguage ? items : confirmed} segments={segments} onChange={load} onSeek={jump} teacherVoice /></div>
+          <div hidden={activeTab !== 'review'}><h2 className="reading-section-title">待核对</h2><ItemsBlock items={wrongLanguage ? items : pending} segments={segments} onChange={load} onSeek={jump} /><ReviewNotes notes={wrongLanguage ? null : data.notes} segments={segments} onSeek={jump} /></div>
+        </section>
+        <aside className="session-reading-rail">
+          {session.audio_path && <section className="glass-panel session-audio-files">
+            <div className="panel-heading"><h2>录音文件</h2><span className="small">{audio_files?.length || 1} 段</span></div>
+            {(audio_files?.length ? audio_files : [{ index: 0, name: '课堂录音', duration: session.audio_duration_seconds }]).map((file, index) => <button key={file.index} onClick={() => setFileSignal({ index: file.index })} className="session-audio-file" aria-label={`播放录音 ${index + 1}：${file.name}`}><span><strong>录音 {String(index + 1).padStart(2, '0')}</strong><small title={file.name}>{file.name}</small></span><time>{fmt(file.duration)}</time><Icon name="play" width="18" /></button>)}
+          </section>}
+          <section className="glass-panel session-timeline">
+            <h2>章节目录</h2>
+            {!wrongLanguage && (data.notes?.timeline || data.notes?.knowledge || data.notes?.chapters || topics).map((entry: any, index: number) => <button key={index} className="session-timeline-entry" disabled={entry.start_seconds == null || !session.audio_path} onClick={() => jump(entry.start_seconds)}>
+              <i /><time>{entry.start_seconds == null ? '—' : fmt(entry.start_seconds)}</time><span><strong>{displayTitle(entry.title, chineseEvidence(entry, segments))}</strong>{entry.summary && <small>{displaySummary(entry.summary, chineseEvidence(entry, segments))}</small>}</span>
+            </button>)}
+            {(!data.notes && !topics.length) && <p className="muted small">整理完成后显示内容时间轴。</p>}
+          </section>
+          <section className="glass-panel session-important">
+            <div className="panel-heading"><h2>重要事项</h2><button className="text-button" onClick={() => setActiveTab('items')}>查看全部<Icon name="chevron" width="14" /></button></div>
+            {!wrongLanguage && confirmed.slice(0, 3).map(item => <div className="overview-task" key={item.id}><input type="checkbox" checked={!!item.is_completed} aria-label={`完成：${item.title}`} disabled={processing} onChange={async e => {
+              try { await api.updateItem(item.id, { is_completed: e.target.checked ? 1 : 0 }); await load(); } catch (error: any) { setErr(error.message); }
+            }} /><button className="task-copy" onClick={() => setActiveTab('items')}><strong>{displayTitle(item.title, chineseEvidence(item, segments))}</strong><span>{item.normalized_date || '日期待确认'}</span></button></div>)}
+            {(!confirmed.length || wrongLanguage) && <p className="muted small">暂无已整理的事项。</p>}
+          </section>
+        </aside>
+      </div>
       {!!data.revisions?.length && <details className="transcript-fold"><summary>历史版本 · {data.revisions.length} 份</summary>
         <p className="small muted">重新处理前的转写、总结和事项保存在本机，不会混进当前笔记。</p>
         {data.revisions.map((r: any) => <button key={r.id} className="ghost" onClick={async () => {

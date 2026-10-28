@@ -275,6 +275,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if p == "/api/state" and method == "GET":
             return self._state()
 
+        if p == "/api/dashboard" and method == "GET":
+            sem = db.get_active_semester()
+            return _send_json(self, db.dashboard_overview(sem["id"]) if sem else {
+                "recent_sessions": [], "items": [],
+            })
+
         # 学期
         if p == "/api/semesters" and method == "GET":
             return _send_json(self, {"semesters": db.list_semesters()})

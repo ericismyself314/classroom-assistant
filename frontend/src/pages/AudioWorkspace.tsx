@@ -6,6 +6,7 @@ import { MAX_AUDIO_FILES, mergeAudioFiles, totalAudioBytes } from '../audioFiles
 import { localDateISO } from '../localDate';
 import { Course, Session } from '../types';
 import { View } from '../App';
+import { TranscriptPreview } from '../components/TranscriptPreview';
 
 const NEW_SESSION = '__new__';
 
@@ -72,13 +73,12 @@ export function AudioWorkspace({ navigate, courseId: initialCourseId, sessionId:
     <div className="audio-workspace">
       <div className="audio-workspace-header">
         <div>
-          <div className="audio-eyebrow">课堂助手 · 音频工作台</div>
-          <h1 className="page-title">录音与导入</h1>
+          <h1 className="page-title">录音与转写</h1>
         </div>
         <button className="ghost" onClick={() => navigate({ name: 'week' })}>返回本周</button>
       </div>
 
-      <section className="card audio-target-card">
+      <section className="card audio-target-card" aria-label="课程与课堂设置">
         <div className="audio-section-title"><div><h2>课程与课堂</h2></div>
           {session && <button className="ghost" onClick={() => navigate({ name: 'session', id: session.id })}>查看课堂记录</button>}
         </div>
@@ -282,14 +282,15 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
                 onChange={(e) => { addFiles(Array.from(e.target.files || [])); e.currentTarget.value = ''; }} />
             </label>
           </div> : <div className="audio-microphone-panel">
-            <MicrophoneRecorder onAddFile={(file) => addFiles([file])} onRemoveFile={removeQueuedFile} onRecordingChange={setRecordingActive} disabled={busy} />
+            <MicrophoneRecorder title={sessionTitle || course.name} onAddFile={(file) => addFiles([file])} onRemoveFile={removeQueuedFile} onRecordingChange={setRecordingActive} disabled={busy} />
           </div>}
 
-          <div className="audio-recognition-panel">
+          <details className="audio-recognition-panel">
+            <summary>语音识别设置</summary>
             <div><b>语音识别设置</b><span className="small muted">修改后保存为本课程设置，稍后处理也会使用</span></div>
             <RecognitionSettings value={recognition.value} onChange={recognition.setValue} disabled={busy || !recognition.ready} />
             {recognition.error && <p className="quality-warning" role="alert">{recognition.error}</p>}
-          </div>
+          </details>
         </section>
 
         <aside className="card audio-queue-card">
@@ -342,6 +343,7 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
             onClick={async () => { try { setBusy(true); await api.process(session.id, { mode: 'analyze' }); navigate({ name: 'session', id: session.id }); } catch (e: any) { setError(e.message || '重新分析失败'); setBusy(false); } }}>
             仅重新分析现有转写
           </button>}
+          <details className="queue-preview"><summary>查看已有转写与笔记</summary><TranscriptPreview sessionId={session?.id} /></details>
         </aside>
       </div>
     </>

@@ -33,7 +33,7 @@ export function Sources({ evidence, onSeek, segments = [] }: { evidence: any[]; 
   </details>;
 }
 
-export function ClassNotes({ notes, segments = [], onSeek, processing, onEdit, beforeKnowledge }: { notes: any; segments?: Segment[]; onSeek: (s: number) => void; processing: boolean; onEdit?: (index: number) => void; beforeKnowledge?: ReactNode }) {
+export function ClassNotes({ notes, segments = [], onSeek, processing, onEdit, beforeKnowledge, hideTimeline = false }: { notes: any; segments?: Segment[]; onSeek: (s: number) => void; processing: boolean; onEdit?: (index: number) => void; beforeKnowledge?: ReactNode; hideTimeline?: boolean }) {
   const rawChapters: any[] = notes?.knowledge || notes?.chapters || [];
   const legacy: any[] = notes?.version >= 3 ? rawChapters : compactLegacy(rawChapters);
   const normalize = (row: any, parentEvidence = '') => {
@@ -53,12 +53,12 @@ export function ClassNotes({ notes, segments = [], onSeek, processing, onEdit, b
   return <>
     <section className="notes-overview" aria-label="课堂概览">
       <div className="notes-eyebrow">课堂概览</div>
-      <h2>{title || (chapters.length ? '本节课内容整理' : '先有可靠的转写，再有清晰的笔记')}</h2>
+      <h2>{title || (chapters.length ? '本节课内容整理' : '暂无课堂整理')}</h2>
       {chapters.length ? <p className="overview-lead">这节课主要围绕 {chapters.slice(0, 3).map(c => c.title).filter(Boolean).join('、')} 展开。</p>
         : <p className="muted">{processing ? '正在整理，完成后会显示课程标题和分块笔记。' : notes?.transcript_edited ? '转写已修正。点击「仅重新分析」更新课程整理；修改前的结果保存在历史版本。' : notes ? '暂未得到足够的课程内容。请先查看完整转写。' : '这是旧版结果或尚未分析。转写正确时可「仅重新分析」；语言识别错误时需「重新转写」。'}</p>}
       <div className="small muted">本地 AI 整理 · 按课堂原文组织，不补充录音外的知识；重要信息请核对原话。</div>
     </section>
-    <div className="section-heading"><h2>时间轴分块</h2><span className="muted small">按老师的讲授顺序，合并成少量内容段</span></div>
+    {!hideTimeline && <><div className="section-heading"><h2>时间轴分块</h2><span className="muted small">按老师的讲授顺序，合并成少量内容段</span></div>
     <div className="timeline-list">
       {timeline.map((c, i) => <article className="timeline-card" key={i}>
         <div className="timeline-index">{String(i + 1).padStart(2, '0')}</div>
@@ -66,7 +66,7 @@ export function ClassNotes({ notes, segments = [], onSeek, processing, onEdit, b
           {c.start_seconds != null && <button className="source-time" onClick={() => onSeek(c.start_seconds)}>▶ {time(c.start_seconds)}</button>}</div>
           <p>{c.summary}</p></div>
       </article>)}
-    </div>
+    </div></>}
     {beforeKnowledge}
     <div className="section-heading"><h2>知识点梳理</h2><span className="muted small">按内容块阅读，重点内容单独标记</span></div>
     {chapters.map((c, i) => <article id={`chapter-${i}`} className="chapter-card" key={i}>

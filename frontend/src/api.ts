@@ -205,6 +205,7 @@ export const api = {
   setSlots: (id: string, slots: Slot[]) => req(`/api/courses/${id}/slots`, { method: 'PUT', body: JSON.stringify({ slots }) }),
 
   week: (center?: string) => req('/api/week' + (center ? `?center=${center}` : '')),
+  dashboard: () => req('/api/dashboard'),
   createSession: (b: any) => req('/api/sessions', { method: 'POST', body: JSON.stringify(b) }),
   sessions: (cid: string) => req(`/api/courses/${cid}/sessions`),
   sessionDetail: (id: string) => req(`/api/sessions/${id}`),

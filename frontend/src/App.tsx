@@ -20,10 +20,10 @@ export type View =
   | { name: 'settings' };
 
 const NAV = [
-  { key: 'week', label: '今天', icon: 'calendar' },
-  { key: 'audio', label: '录音与导入', icon: 'microphone' },
-  { key: 'courses', label: '课程', icon: 'book' },
-  { key: 'important', label: '我的待办', icon: 'bookmark' },
+  { key: 'week', label: '课程总览', icon: 'calendar' },
+  { key: 'audio', label: '录音与转写', icon: 'microphone' },
+  { key: 'important', label: '重要事项', icon: 'bookmark' },
+  { key: 'courses', label: '我的课程', icon: 'book' },
   { key: 'search', label: '搜索笔记', icon: 'search' },
   { key: 'settings', label: '设置', icon: 'settings' },
 ] as const;
@@ -65,7 +65,7 @@ export default function App() {
     return <Onboarding onDone={() => { setHasSemester(true); setView({ name: 'week' }); }} />;
   }
 
-  const activeKey = view.name === 'courses' || view.name === 'session' ? 'courses' : view.name;
+  const activeKey = view.name === 'session' ? 'audio' : view.name;
 
   return (
     <div className="app">
@@ -74,7 +74,7 @@ export default function App() {
           <img src={logoUrl} alt="" aria-hidden="true" />
           <span>课堂助手</span>
         </div>
-        {NAV.map((n) => (
+        {NAV.filter(n => n.key !== 'settings').map((n) => (
           <button
             key={n.key}
             type="button"
@@ -86,7 +86,7 @@ export default function App() {
           </button>
         ))}
         <div className="spacer" />
-        <div className="foot">本地运行 · 数据留在你的电脑</div>
+        <button type="button" className={`nav-item ${activeKey === 'settings' ? 'active' : ''}`} aria-current={activeKey === 'settings' ? 'page' : undefined} onClick={() => navigate({ name: 'settings' })}><NavigationIcon name="settings" /><span>设置</span></button>
       </div>
       <div className="content">
         {view.name === 'week' && <ThisWeek navigate={navigate} />}

@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { Icon } from './Icon';
+import { MicrophoneWaveform } from './MicrophoneWaveform';
 
 type RecorderPhase = 'idle' | 'recording' | 'paused' | 'ready';
 
@@ -41,12 +43,13 @@ function microphoneError(error: unknown): string {
   return '麦克风启动失败，请检查设备和 Windows 麦克风权限后重试。';
 }
 
-export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange, disabled = false, hidden = false }: {
+export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange, disabled = false, hidden = false, title }: {
   onAddFile: (file: File) => boolean;
   onRemoveFile?: (file: File) => boolean;
   onRecordingChange?: (active: boolean) => void;
   disabled?: boolean;
   hidden?: boolean;
+  title?: string;
 }) {
   const [phase, setPhase] = useState<RecorderPhase>('idle');
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -55,6 +58,7 @@ export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange,
   const [added, setAdded] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [meterStream, setMeterStream] = useState<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -100,6 +104,7 @@ export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange,
   const releaseStream = () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    setMeterStream(null);
   };
 
   const start = async () => {
@@ -111,6 +116,7 @@ export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange,
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+      setMeterStream(stream);
       const preferredType = ['audio/webm;codecs=opus', 'audio/webm']
         .find((type) => MediaRecorder.isTypeSupported(type));
       const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType, audioBitsPerSecond: 96000 } : undefined);
@@ -275,16 +281,19 @@ export function MicrophoneRecorder({ onAddFile, onRemoveFile, onRecordingChange,
     <section className="mic-recorder" aria-label="电脑麦克风录音" hidden={hidden}>
       <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <b>电脑麦克风录音</b>
+          <b>{title || '电脑麦克风录音'}</b>
         </div>
-        {(phase === 'recording' || phase === 'paused') && <span className={`badge ${phase === 'recording' ? 'red' : 'gray'}`}>{phase === 'recording' ? '正在录音' : '已暂停'}</span>}
+        <span className={`recorder-status ${phase === 'recording' ? 'live' : ''}`}><i />{phase === 'recording' ? '正在录音' : phase === 'paused' ? '已暂停' : phase === 'ready' ? '录音已就绪' : '准备录音'}</span>
+      </div>
+      <div className="recorder-display"><span className="mic-recorder-time" aria-live="off">{formatDuration(elapsedMs)}</span>
+        <MicrophoneWaveform stream={meterStream} active={phase === 'recording'} />
+        <span className="small muted">{phase === 'recording' ? '麦克风 · 系统默认设备' : phase === 'paused' ? '录音已暂停' : phase === 'ready' ? '可试听或保存本段录音' : '麦克风 · 录音开始后显示输入电平'}</span>
       </div>
       <div className="row mic-recorder-controls">
-        {phase === 'idle' && <button className="primary" type="button" disabled={disabled} onClick={start}>开始录音</button>}
+        {phase === 'idle' && <button className="primary" type="button" disabled={disabled} onClick={start}><Icon name="mic" />开始录音</button>}
         {(phase === 'recording' || phase === 'paused') && <>
-          <span className="mic-recorder-time" aria-live="off">{formatDuration(elapsedMs)}</span>
-          <button type="button" disabled={disabled} onClick={pauseOrResume}>{phase === 'recording' ? '暂停录音' : '继续录音'}</button>
-          <button className="danger" type="button" disabled={disabled} onClick={stop}>停止并试听</button>
+          <button className="primary" type="button" disabled={disabled} onClick={pauseOrResume}><Icon name={phase === 'recording' ? 'pause' : 'play'} />{phase === 'recording' ? '暂停' : '继续录音'}</button>
+          <button type="button" disabled={disabled} onClick={stop}><Icon name="stop" />结束录音</button>
           <button className="ghost danger" type="button" disabled={disabled} onClick={stopAndDiscard}>停止并丢弃本段</button>
         </>}
         {phase === 'ready' && file && <>

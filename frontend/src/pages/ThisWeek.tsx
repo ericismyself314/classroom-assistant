@@ -1,238 +1,157 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api';
-import { WeekDay, SlotOcc } from '../types';
+import { Course, Item, Session, SlotOcc, WeekDay } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
+import { Icon } from '../components/Icon';
 import { View } from '../App';
 import { localDateISO } from '../localDate';
+import { minutes, nextOccurrence, timetableRows } from '../schedule';
 
-function shift(d: string, days: number): string {
-  const dt = new Date(d + 'T00:00:00');
-  dt.setDate(dt.getDate() + days);
-  return localDateISO(dt);
+function shift(date: string, days: number) {
+  const value = new Date(date + 'T00:00:00');
+  value.setDate(value.getDate() + days);
+  return localDateISO(value);
 }
-
-function toMinutes(value: string): number {
-  const [hour, minute] = value.split(':').map(Number);
-  return hour * 60 + minute;
+function dateLabel(date: string) {
+  const value = new Date(date + 'T00:00:00');
+  return `${value.getMonth() + 1}月${value.getDate()}日`;
 }
-
-function readableDate(date: string): string {
-  if (!date) return '';
-  const dt = new Date(date + 'T00:00:00');
-  return `${dt.getMonth() + 1} 月 ${dt.getDate()} 日`;
+function duration(seconds: number | null) {
+  if (seconds == null) return '时长未知';
+  return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 }
+type RecentSession = Session & { course_name: string };
 
-function greeting(now: Date): string {
-  if (now.getHours() < 11) return '早上好';
-  if (now.getHours() < 14) return '中午好';
-  if (now.getHours() < 18) return '下午好';
-  return '晚上好';
-}
-
-function MicIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="9" y="2.5" width="6" height="12" rx="3" />
-      <path d="M5.5 11v1a6.5 6.5 0 0 0 13 0v-1M12 18.5V22M9 22h6" />
-    </svg>
-  );
-}
-
-export function ThisWeek({ navigate }: { navigate: (v: View) => void }) {
+export function ThisWeek({ navigate }: { navigate: (view: View) => void }) {
   const [center, setCenter] = useState(localDateISO());
   const [week, setWeek] = useState<WeekDay[]>([]);
-  const [semName, setSemName] = useState('');
-  const [weekHint, setWeekHint] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState('');
   const [now, setNow] = useState(new Date());
-  const autoJumped = useRef(false);
-  const [selectedDate, setSelectedDate] = useState(localDateISO());
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [reload, setReload] = useState(0);
+  const [items, setItems] = useState<Item[]>([]);
+  const [recent, setRecent] = useState<RecentSession[]>([]);
+  const [overviewError, setOverviewError] = useState('');
+  const [savingItem, setSavingItem] = useState<string | null>(null);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [selected, setSelected] = useState<{ slot: SlotOcc; date: string } | null>(null);
+  const today = localDateISO(now);
 
-  const load = () => {
-    setLoading(true);
-    setLoadError('');
-    api.week(center).then((r) => {
-      const start = r.semester?.start_date;
-      if (!autoJumped.current && start && center < start) {
-        autoJumped.current = true;
-        setWeekHint(`学期从 ${start} 开始，已显示第一周`);
-        setCenter(start);
-        setSelectedDate(start);
-        return;
-      }
-      setWeek(r.week);
-      setSemName(r.semester?.name || '本学期');
-    }).catch((error) => setLoadError(error instanceof Error ? error.message : '课表读取失败'))
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(load, [center]);
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(new Date()), 60_000);
+    let live = true;
+    api.courses().then(result => { if (live) setCourses(result.courses); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
+  useEffect(() => { setSelected(null); }, [center]);
+  useEffect(() => {
+    let live = true;
+    setLoading(true); setError('');
+    api.week(center).then(result => { if (live) setWeek(result.week); })
+      .catch(e => { if (live) setError(e.message || '课表读取失败'); })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [center, reload]);
+  useEffect(() => {
+    let live = true;
+    setOverviewError('');
+    api.dashboard().then(result => {
+      if (live) { setItems(result.items); setRecent(result.recent_sessions); }
+    }).catch(e => { if (live) setOverviewError(e.message || '最近课堂读取失败'); });
+    return () => { live = false; };
+  }, [reload]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const openLesson = (occ: SlotOcc, date: string) => {
-    if (occ.session) { navigate({ name: 'session', id: occ.session.id }); return; }
-    navigate({ name: 'audio', courseId: occ.course_id, date, title: occ.course_name });
-  };
+  const next = nextOccurrence(week, today, now.getHours() * 60 + now.getMinutes());
+  const focused = selected || next;
+  const rows = timetableRows(week);
+  const openLesson = (slot: SlotOcc, date: string) => slot.session
+    ? navigate({ name: 'session', id: slot.session.id })
+    : navigate({ name: 'audio', courseId: slot.course_id, date, title: slot.course_name });
+  async function completeItem(item: Item) {
+    if (savingItem) return;
+    setSavingItem(item.id);
+    try {
+      await api.updateItem(item.id, { is_completed: 1 });
+      setItems(current => current.filter(value => value.id !== item.id));
+    } catch (e: any) { setOverviewError(e.message || '事项更新失败'); }
+    finally { setSavingItem(null); }
+  }
 
-  const addAudio = (occ: SlotOcc, date: string, source: 'microphone' | 'upload') => {
-    navigate({
-      name: 'audio', courseId: occ.course_id, sessionId: occ.session?.id,
-      date, title: occ.course_name, source,
-    });
-  };
-
-  const selectedDay = week.find((day) => day.date === selectedDate) || week.find((day) => day.is_today) || week[0];
-  const sortedSlots = useMemo(
-    () => [...(selectedDay?.slots || [])].sort((a, b) => a.start_time.localeCompare(b.start_time)),
-    [selectedDay],
-  );
-  const currentMinute = now.getHours() * 60 + now.getMinutes();
-  const currentLesson = selectedDay?.is_today
-    ? sortedSlots.find((slot) => currentMinute >= toMinutes(slot.start_time) && currentMinute < toMinutes(slot.end_time))
-    : undefined;
-  const nextLesson = currentLesson || (selectedDay?.is_today
-    ? sortedSlots.find((slot) => currentMinute < toMinutes(slot.start_time))
-    : sortedSlots[0]);
-  const nextMinutes = nextLesson && selectedDay?.is_today ? toMinutes(nextLesson.start_time) - currentMinute : null;
-  const isCurrentWeek = week.some((day) => day.is_today);
-  const weekLessonCount = week.reduce((total, day) => total + day.slots.length, 0);
-
-  const shiftWeek = (days: number) => {
-    setCenter((current) => shift(current, days));
-    setSelectedDate((current) => shift(current, days));
-  };
-
-  const lessonState = (occ: SlotOcc) => {
-    if (!selectedDay?.is_today) return '';
-    const start = toMinutes(occ.start_time);
-    const end = toMinutes(occ.end_time);
-    if (currentMinute >= start && currentMinute < end) return '正在上课';
-    if (currentMinute >= end) return '已结束';
-    const diff = start - currentMinute;
-    if (diff < 60) return `${diff} 分钟后`;
-    return `还有 ${Math.floor(diff / 60)} 小时`;
-  };
-
-  if (loading && !week.length) return <div className="empty">正在读取课表…</div>;
-
-  return (
-    <div className="today-dashboard">
-      <header className="today-topbar">
-        <div>
-          <div className="today-eyebrow">{semName}</div>
-          <h1>{selectedDay?.is_today ? `${greeting(now)}，今天的课程已准备好` : `${readableDate(selectedDay?.date || '')}的课程安排`}</h1>
-          <p>{selectedDay ? `${readableDate(selectedDay.date)} · ${selectedDay.weekday_cn}` : ''}</p>
-        </div>
-        <div className="week-switcher" aria-label="周切换">
-          <button type="button" aria-label="上一周" onClick={() => shiftWeek(-7)}>‹</button>
-          <span>{week.length ? `${week[0].date.slice(5)} — ${week[week.length - 1].date.slice(5)}` : ''}</span>
-          <button type="button" aria-label="下一周" onClick={() => shiftWeek(7)}>›</button>
-          {!isCurrentWeek && <button className="back-this-week" type="button" onClick={() => { setCenter(localDateISO()); setSelectedDate(localDateISO()); }}>回到本周</button>}
-        </div>
-      </header>
-
-      {weekHint && <div className="dashboard-notice">{weekHint}</div>}
-      {loadError && <div className="dashboard-notice error">{loadError}<button type="button" onClick={load}>重试</button></div>}
-
-      {nextLesson ? (
-        <section className="next-class-hero">
-          <div className="next-class-copy">
-            <div className="next-class-status">
-              <span>{currentLesson ? '正在上课' : '下一节课'}</span>
-              {nextMinutes !== null && nextMinutes > 0 && <b>{nextMinutes < 60 ? `${nextMinutes} 分钟后开始` : `${Math.floor(nextMinutes / 60)} 小时后开始`}</b>}
-            </div>
-            <button type="button" className="hero-course-name" onClick={() => openLesson(nextLesson, selectedDay.date)}>{nextLesson.course_name}</button>
-            <div className="next-class-meta">
-              <span>◷ {nextLesson.start_time}–{nextLesson.end_time}</span>
-              {nextLesson.location && <span>⌖ {nextLesson.location}</span>}
-              <span>第 {nextLesson.week_number} 周</span>
-            </div>
-          </div>
-          <button className="record-orb" type="button" onClick={() => addAudio(nextLesson, selectedDay.date, 'microphone')}>
-            <MicIcon />
-            <strong>开始录音</strong>
-            <small>{currentLesson ? '记录当前课程' : '提前进入录音页'}</small>
-          </button>
-        </section>
-      ) : (
-        <section className="next-class-hero all-done">
-          <div>
-            <div className="next-class-status"><span>今日完成</span></div>
-            <h2>{selectedDay?.slots.length ? '今天的课程都结束了' : '今天没有课程安排'}</h2>
-            <p>可以整理课堂笔记，或者查看本周其他课程。</p>
-          </div>
-          <button className="hero-secondary" type="button" onClick={() => navigate({ name: 'courses' })}>查看课程</button>
-        </section>
-      )}
-
-      <div className="schedule-dashboard-grid">
-        <section className="today-timeline-card">
-          <div className="dashboard-section-heading">
-            <div><span>今日安排</span><h2>{selectedDay?.is_today ? '今天的课程' : `${readableDate(selectedDay?.date || '')}的课程`}</h2></div>
-            <b>{sortedSlots.length} 节</b>
-          </div>
-          <nav className="day-picker" aria-label="选择日期">
-            {week.map((day) => (
-              <button key={day.date} type="button" className={selectedDay?.date === day.date ? 'active' : ''}
-                aria-pressed={selectedDay?.date === day.date} onClick={() => setSelectedDate(day.date)}>
-                <span>{day.weekday_cn}</span><b>{day.date.slice(-2)}</b>
-              </button>
-            ))}
-          </nav>
-          <div className="timeline-list-new">
-            {!sortedSlots.length ? <div className="no-lessons">这一天没有课，可以安心安排自己的时间。</div> : sortedSlots.map((occ) => {
-              const state = lessonState(occ);
-              const isActive = state === '正在上课' || occ === nextLesson;
-              return (
-                <article className={`timeline-lesson ${isActive ? 'active' : ''}`} key={`${occ.course_id}-${occ.start_time}`}>
-                  <div className="timeline-time"><strong>{occ.start_time}</strong><span>{occ.end_time}</span></div>
-                  <div className="timeline-marker"><i /></div>
-                  <button className="timeline-lesson-copy" type="button" onClick={() => openLesson(occ, selectedDay.date)}>
-                    <strong>{occ.course_name}</strong>
-                    <span>{occ.location || '地点待定'}</span>
-                  </button>
-                  <div className="timeline-actions">
-                    {state && <span className={`time-state ${state === '正在上课' ? 'live' : ''}`}>{state}</span>}
-                    {occ.session && <StatusBadge status={occ.session.status} />}
-                    <button type="button" onClick={() => addAudio(occ, selectedDay.date, 'microphone')}>录音</button>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="week-board-card">
-          <div className="dashboard-section-heading">
-            <div><span>一周课程表</span><h2>本周共 {weekLessonCount} 节课</h2></div>
-            <button type="button" className="week-board-link" onClick={() => navigate({ name: 'courses' })}>管理课程</button>
-          </div>
-          <div className="week-board" role="grid" aria-label="本周课程">
-            {week.map((day) => (
-              <div className={`week-board-day ${day.is_today ? 'today' : ''} ${day.date === selectedDay?.date ? 'selected' : ''}`} key={day.date} role="gridcell">
-                <button className="week-board-day-head" type="button" onClick={() => setSelectedDate(day.date)}>
-                  <span>{day.weekday_cn}</span><b>{day.date.slice(5)}</b>
-                </button>
-                <div className="week-board-lessons">
-                  {[...day.slots].sort((a, b) => a.start_time.localeCompare(b.start_time)).map((occ) => (
-                    <button type="button" className="week-mini-lesson" style={{ borderLeftColor: occ.color || '#2e7d4f' }}
-                      key={`${occ.course_id}-${occ.start_time}`} onClick={() => openLesson(occ, day.date)}>
-                      <small>{occ.start_time}</small>
-                      <strong>{occ.course_name}</strong>
-                      {occ.location && <span>{occ.location}</span>}
-                    </button>
-                  ))}
-                  {!day.slots.length && <span className="week-day-empty">无课</span>}
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
+  return <div className="overview-page">
+    <header className="surface-header">
+      <h1 className="page-title">课程总览</h1>
+      <div className="row header-actions">
+        <button className="overview-search" onClick={() => navigate({ name: 'search' })}><Icon name="search" /><span>搜索课程、录音或笔记…</span></button>
+        <button className="primary" onClick={() => navigate({ name: 'audio', source: 'microphone' })}><Icon name="plus" />新建录音</button>
       </div>
+    </header>
+    {(error || overviewError) && <div className="dashboard-notice error" role="alert">{error || overviewError}<button onClick={() => setReload(value => value + 1)}>重试</button></div>}
+    <div className="overview-grid">
+      <section className="glass-panel schedule-panel" aria-labelledby="schedule-title" aria-busy={loading}>
+        <div className="panel-heading">
+          <div className="row wrap"><h2 id="schedule-title">本周课表</h2><span className="muted small">{week.length ? `${dateLabel(week[0].date)}—${dateLabel(week[week.length - 1].date)}` : ''}</span></div>
+          <div className="calendar-controls">
+            <button className="icon-button previous" aria-label="上一周" onClick={() => setCenter(value => shift(value, -7))}><Icon name="chevron" /></button>
+            <button onClick={() => setCenter(localDateISO())}>本周</button>
+            <button className="icon-button" aria-label="下一周" onClick={() => setCenter(value => shift(value, 7))}><Icon name="chevron" /></button>
+          </div>
+        </div>
+        <div className="schedule-scroll">
+          {loading && !week.length ? <div className="empty">正在读取课表…</div> : <table className="weekly-timetable">
+            <caption className="sr-only">{week[0]?.date} 起的一周课表，可点击课程查看课堂或录音</caption>
+            <thead><tr><th scope="col"><span className="sr-only">时间</span></th>{week.map(day => <th scope="col" key={day.date} className={day.date === today ? 'is-today' : ''}><span>{day.weekday_cn.replace('星期', '').replace('周', '')}</span><b aria-label={`${day.date}${day.date === today ? '，今天' : ''}`}>{Number(day.date.slice(-2))}</b></th>)}</tr></thead>
+            <tbody>{rows.map(time => <tr key={time}><th scope="row">{time}</th>{week.map(day => <td key={day.date} className={day.date === today ? 'is-today' : ''}>
+              {day.slots.filter(slot => slot.start_time === time).map((slot, index) => <button aria-pressed={selected?.slot === slot} className={`calendar-lesson ${selected?.slot === slot ? 'is-selected' : ''} ${day.date === today && minutes(slot.start_time) <= now.getHours() * 60 + now.getMinutes() && minutes(slot.end_time) > now.getHours() * 60 + now.getMinutes() ? 'in-progress' : ''}`} key={`${slot.course_id}-${index}`} onClick={() => setSelected({ slot, date: day.date })} title={`${slot.course_name} · ${slot.start_time}—${slot.end_time} · ${slot.location || '地点待定'}`}>
+                <strong>{slot.course_name}</strong><span>{slot.location || '地点待定'}</span><small>{slot.start_time}—{slot.end_time}</small>
+              </button>)}
+              {!day.slots.some(slot => slot.start_time === time) && <span className="calendar-empty" aria-hidden="true">—</span>}
+            </td>)}</tr>)}</tbody>
+          </table>}
+          {!loading && !rows.length && <div className="schedule-empty"><Icon name="calendar" /><p>这一周暂无课程安排</p><button onClick={() => navigate({ name: 'courses' })}>管理课程与课表</button></div>}
+        </div>
+        <button className="text-button manage-schedule" onClick={() => navigate({ name: 'courses' })}>管理课程与课表<Icon name="chevron" width="14" /></button>
+      </section>
+      <aside className="overview-rail">
+        <section className="glass-panel next-lesson-panel">
+          <div className="panel-heading"><h2>{selected ? '已选课程' : next?.ongoing ? '正在上课' : '下一节课'}</h2><Icon name="book" /></div>
+          {focused ? <>
+            <div className="next-lesson-copy"><h3>{focused.slot.course_name}</h3>
+              <p><Icon name="clock" />{focused.date !== today && <span>{dateLabel(focused.date)} · </span>}{focused.slot.start_time}—{focused.slot.end_time}</p>
+              <p><Icon name="pin" />{focused.slot.location || '地点待定'}</p>
+            </div>
+            <button className="course-detail-link" onClick={() => openLesson(focused.slot, focused.date)}>查看课堂<Icon name="chevron" width="14" /></button>
+          </> : <div className="quiet-empty"><p>{loading ? '正在读取课程…' : '所显示周内暂无后续课程'}</p><button onClick={() => navigate({ name: 'audio', source: 'microphone' })}><Icon name="mic" />新建录音</button></div>}
+        </section>
+        <section className="glass-panel course-capture-panel">
+          <div className="panel-heading"><h2>记录课堂</h2></div>
+          <div className="capture-actions">{(['microphone', 'upload'] as const).map(source => <button key={source} onClick={() => navigate({ name: 'audio', courseId: focused?.slot.course_id, sessionId: focused?.slot.session?.id, date: focused?.date, title: focused?.slot.course_name, source })}><Icon name={source === 'microphone' ? 'mic' : 'upload'} /><span>{source === 'microphone' ? '电脑录音' : '上传录音'}</span></button>)}</div>
+        </section>
+        <section className="glass-panel overview-tasks">
+          <div className="panel-heading"><h2>重要事项</h2><button className="text-button" onClick={() => navigate({ name: 'important' })}>查看全部<Icon name="chevron" width="14" /></button></div>
+          {!items.length && <p className="quiet-empty">{overviewError ? '事项暂时无法读取' : '暂无待完成事项'}</p>}
+          {items.slice(0, 3).map(item => <div className="overview-task" key={item.id}>
+            <input type="checkbox" checked={savingItem === item.id} disabled={savingItem !== null} aria-label={`完成：${item.title}`} onChange={() => completeItem(item)} />
+            <button className="task-copy" onClick={() => navigate({ name: 'session', id: item.session_id })}><strong>{item.title}</strong><span>{item.normalized_date ? dateLabel(item.normalized_date) : '日期待确认'}{item.confidence === 'uncertain' || (item.verification_status === 'pending' && !item.is_confirmed) ? ' · 待核对' : ''}</span></button>
+          </div>)}
+        </section>
+      </aside>
+      <section className="glass-panel recent-classes">
+        <div className="panel-heading"><h2>最近课堂</h2><button className="text-button" onClick={() => navigate({ name: 'courses' })}>查看全部<Icon name="chevron" width="14" /></button></div>
+        {!recent.length && <p className="quiet-empty">{overviewError ? '课堂暂时无法读取' : '录制或导入后，课堂记录会显示在这里'}</p>}
+        {recent.slice(0, 3).map(session => <button className="recent-class-row" key={session.id} onClick={() => navigate({ name: 'session', id: session.id })}>
+          <span className="play-disc"><Icon name={session.audio_path ? 'play' : 'file'} /></span>
+          <span className="recent-class-copy"><strong>{session.title || session.course_name}</strong><small>{session.course_name} · {session.session_date}{session.location ? ` · ${session.location}` : ''}</small></span>
+          <StatusBadge status={session.status} /><span className="recent-duration">{session.audio_path ? duration(session.audio_duration_seconds) : '文字稿'}</span><Icon name="chevron" width="16" />
+        </button>)}
+      </section>
+      <section className="glass-panel overview-courses">
+        <div className="panel-heading"><h2>我的课程</h2><button className="text-button" onClick={() => navigate({ name: 'courses' })}>管理课程<Icon name="chevron" width="14" /></button></div>
+        <div className="course-tile-grid">{courses.map(course => <button className="course-tile" key={course.id} onClick={() => navigate({ name: 'audio', courseId: course.id, title: course.name, source: 'microphone' })}><Icon name="book" /><span><strong>{course.name}</strong><small>{course.code || course.location || '查看课程录音'}</small></span><Icon name="chevron" width="14" /></button>)}</div>
+        {!courses.length && <button onClick={() => navigate({ name: 'courses' })}>添加课程</button>}
+      </section>
     </div>
-  );
+  </div>;
 }
