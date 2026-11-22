@@ -21,7 +21,8 @@ export function MicrophoneWaveform({ stream, active }: { stream: MediaStream | n
         analyser.getByteTimeDomainData(samples);
         setLevels(Array.from({ length: 48 }, (_, i) => {
           const sample = samples[Math.floor(i * samples.length / 48)];
-          return Math.min(80, Math.max(3, Math.abs(sample - 128) * 1.8));
+          const amplitude = Math.abs(sample - 128) / 128;
+          return Math.max(3, Math.round(42 * Math.sqrt(amplitude)));
         }));
       }, 90);
     } catch { /* Recording still works when an input meter is unavailable. */ }

@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from backend import config, db
+from backend import audio_archive, config, db
 from backend.ai import llm_provider
 from backend.api import make_server
 from backend.logutil import get_logger
@@ -63,6 +63,7 @@ def main() -> None:
         release()
         sys.exit(1)
 
+    audio_archive.start()
     if "--no-gui" in sys.argv:
         start_control_server(lambda: None)
         # windowed PyInstaller 程序没有可读取的 stdout。打包冒烟测试通过
@@ -124,14 +125,16 @@ def main() -> None:
             LOG.warning("WebView2 数据目录创建失败，将回退默认目录: %s", e)
             webview_profile = None
 
-        ui_started_at = time.perf_counter()
         # WebView2 may keep an old SPA document alive even when the local
         # server sends no-store headers. Tie the document URL to index.html so
         # a newly packaged frontend cannot be replaced by a stale cached page.
+        ui_started_at = time.perf_counter()
         ui_url = _versioned_ui_url(url)
         window = webview.create_window(
             "课堂助手", ui_url, width=1280, height=820, min_size=(1024, 680)
         )
+        from backend.window_frame import connect_window_controls
+        connect_window_controls(window)
 
         def _log_window_shown(*_args) -> None:
             LOG.info("桌面窗口已显示（耗时 %.2fs）", time.perf_counter() - ui_started_at)
@@ -188,6 +191,7 @@ def _versioned_ui_url(url: str) -> str:
 
 def _shutdown(server=None) -> None:
     LOG.info("正在关闭应用...")
+    audio_archive.stop()
     llm_provider.shutdown_all()
     if server is not None:
         try:

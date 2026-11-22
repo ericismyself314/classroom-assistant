@@ -1,0 +1,18 @@
+.job-detail-progress > .job-progress { flex: 1; width: 100%; }
+.job-progress .job-progress-heading { gap: 4px 12px; }
+.job-overall { margin: 9px 0 6px; }
+.job-overall-label, .job-measures, .job-timings { font-size: 12px; color: #59675f; }
+.job-overall-label { display: flex; justify-content: space-between; gap: 8px; }
+.job-overall-label b { color: #244d38; font-variant-numeric: tabular-nums; }
+.job-overall progress { display: block; appearance: none; width: 100%; height: 6px; margin-top: 4px; border: 0; border-radius: 6px; overflow: hidden; background: #dce7de; accent-color: #397451; }
+.job-overall progress::-webkit-progress-bar { background: #dce7de; border-radius: inherit; }
+.job-overall progress::-webkit-progress-value { background: #397451; border-radius: inherit; }
+.job-overall progress::-moz-progress-bar { background: #397451; border-radius: inherit; }
+.job-overall progress:indeterminate { appearance: auto; }
+.job-measures { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 5px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.job-eta { color: #28503a; font-weight: 600; }
+.job-timings { margin-top: 7px; }
+.job-timings summary { cursor: pointer; width: fit-content; }
+.job-progress.is-compact .job-overall { margin: 4px 0; }
+.global-job-status[aria-label] { position: sticky; top: 8px; z-index: 5; }
+@media (max-height: 560px) { .global-job-status[aria-label] { position: static; } }

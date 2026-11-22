@@ -196,3 +196,164 @@ def test_restart_repairs_previously_orphaned_session():
     db.mark_interrupted_jobs()
     assert db.get_session(sid)['status'] == 'failed'
     assert db.list_segments(sid)[0]['text'] == 'bond price'
+
+
+def test_truncated_translation_keeps_complete_rows_and_retries_only_missing():
+    class TruncatingReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            ids = [int(i) for i in _re.findall(r'\[(\d+)\]', user)]
+            if len(ids) > 1:
+                rows = [{'index': i, 'text': f'translation {i}'} for i in ids[:-2]]
+                return json.dumps({'translations': rows})[:-2] + ',{"index":18,"text":"unfinished'
+            return json.dumps({'translations': [{'index': ids[0], 'text': f'translation {ids[0]}'}]})
+
+    source = [seg(f'Synthetic lesson sentence number {i}.', i) for i in range(20)]
+    provider = TruncatingReply()
+    out = segment_analysis.translate_for_display(provider, source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == [f'translation {i}' for i in range(20)]
+    assert provider.calls == 3
+
+
+def test_truncated_translation_retries_ambiguous_duplicate_and_incomplete_entries():
+    class AmbiguousReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            ids = [int(i) for i in _re.findall(r'\[(\d+)\]', user)]
+            if len(ids) > 1:
+                return '{"translations":[{"index":0,"text":"wrong A"},{"index":0,"text":"wrong B"},{"index":1,"text":"correct 1"},{"index":2,"text":"incomplete'
+            return json.dumps({'translations': [{'index': ids[0], 'text': f'correct {ids[0]}'}]})
+
+    source = [seg(f'Synthetic lesson sentence {i}.', i) for i in range(3)]
+    provider = AmbiguousReply()
+    out = segment_analysis.translate_for_display(provider, source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == ['correct 0', 'correct 1', 'correct 2']
+    assert provider.calls == 3
+
+
+def test_translation_chunk_uses_local_indexes_and_maps_to_global_positions():
+    class LocalIndexReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            indexes = [int(i) for i in _re.findall(r'\[(\d+)\]', user)]
+            assert indexes == [0, 1]
+            return json.dumps({'translations': [
+                {'index': 0, 'text': '第一段'}, {'index': 1, 'text': '第二段'}
+            ]}, ensure_ascii=False)
+
+    provider = LocalIndexReply()
+    result = segment_analysis._translate_chunk(provider, [seg('first'), seg('second')], offset=37)
+    assert result == {37: '第一段', 38: '第二段'}
+    assert provider.calls == 1
+
+
+def test_translation_chunk_partial_recovery_maps_only_unambiguous_local_indexes():
+    class PartialReply:
+        def chat(self, *args, **kwargs):
+            return ('{"translations":[{"index":0,"text":"wrong A"},'
+                    '{"index":0,"text":"wrong B"},{"index":1,"text":"correct"},'
+                    '{"index":2,"text":"unfinished')
+
+    result = segment_analysis._translate_chunk(PartialReply(), [seg('a'), seg('b'), seg('c')], offset=37)
+    assert result == {38: 'correct'}
+
+
+def test_complete_translation_with_duplicate_indexes_is_retranslated():
+    rows = {'translations': [
+        {'index': 0, 'text': 'wrong A'}, {'index': 0, 'text': 'wrong B'},
+        {'index': 1, 'text': 'correct'},
+    ]}
+    assert segment_analysis._translation_rows(rows) == {1: 'correct'}
+
+
+def test_missing_translations_are_retried_in_a_batch_with_original_mapping():
+    class PartiallyDroppingReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            matches = _re.findall(r'\[(\d+)\][^\n]*sentence (\d+)', user)
+            rows = [{'index': int(index), 'text': f'译文{source}'}
+                    for index, source in matches if self.calls > 1 or int(source) % 2 == 0]
+            return json.dumps({'translations': rows}, ensure_ascii=False)
+    source = [seg(f'Synthetic sentence {i}.', i) for i in range(8)]
+    provider = PartiallyDroppingReply()
+    out = segment_analysis.translate_for_display(provider, source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == [f'译文{i}' for i in range(8)]
+    assert [s['original_text'] for s in out] == [s['original_text'] for s in source]
+    assert provider.calls == 2
+
+
+def test_failed_batch_retry_preserves_individual_fallback_and_source():
+    class GroupThenIndividualReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            matches = _re.findall(r'\[(\d+)\][^\n]*sentence (\d+)', user)
+            if self.calls == 1:
+                return json.dumps({'translations': [{'index': 0, 'text': '译文0'}]})
+            if len(matches) > 1:
+                return '{bad json'
+            index, source = matches[0]
+            if source == '3':
+                return '{bad json'
+            return json.dumps({'translations': [{'index': int(index), 'text': f'译文{source}'}]})
+    source = [seg(f'Synthetic sentence {i}.', i) for i in range(4)]
+    out = segment_analysis.translate_for_display(GroupThenIndividualReply(), source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == ['译文0', '译文1', '译文2', None]
+    assert out[3]['text'] == source[3]['text']
+
+
+def test_batch_retry_rejects_duplicate_and_out_of_range_indices():
+    class AmbiguousBatchReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            matches = _re.findall(r'\[(\d+)\][^\n]*sentence (\d+)', user)
+            if self.calls == 1:
+                return json.dumps({'translations': [{'index': 0, 'text': '译文0'}]})
+            if len(matches) > 1:
+                return json.dumps({'translations': [
+                    {'index': 0, 'text': 'wrong A'}, {'index': 0, 'text': 'wrong B'},
+                    {'index': 1, 'text': '译文2'}, {'index': 99, 'text': 'wrong C'}]})
+            index, source = matches[0]
+            return json.dumps({'translations': [{'index': int(index), 'text': f'译文{source}'}]})
+    source = [seg(f'Synthetic sentence {i}.', i) for i in range(4)]
+    out = segment_analysis.translate_for_display(AmbiguousBatchReply(), source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == ['译文0', '译文1', '译文2', '译文3']
+
+
+def test_batch_retry_nonzero_chunk_offset_preserves_corrections_and_negations(monkeypatch):
+    sentences = [
+        ('Bond prices fall when interest rates rise.', '利率上升时债券价格下跌。'),
+        ('Compare two bonds for your assignment.', '作业要求比较两只债券。'),
+        ('Submit the PDF by November 20.', '请在11月20日前提交PDF。'),
+        ('The report due tomorrow is only an example.', '明天交报告只是举例。'),
+        ('I have not announced any quiz.', '我没有宣布任何测验。'),
+        ('Each student must upload a copy.', '每位学生必须上传一份。'),
+        ('Correction: deadline November 23, not November 20.', '更正：截止日期是11月23日，不是11月20日。'),
+    ]
+    source = [seg(text, i) for i, (text, _) in enumerate(sentences)]
+    translations = dict(sentences)
+    monkeypatch.setattr(segment_analysis, 'split_segments', lambda items, max_chars: [items[:2], items[2:]])
+    class PartialBatchReply:
+        def __init__(self): self.calls = 0
+        def chat(self, system, user, json_mode=False, temperature=0):
+            self.calls += 1
+            rows = []
+            for local, text in _re.findall(r'\[(\d+)\]\s*\([^\n]*?\)\s*([^\n]+)', user):
+                index = int(local)
+                if self.calls == 2 and index not in (0, 3):
+                    continue
+                if self.calls == 3 and index == 2:
+                    continue
+                rows.append({'index': index, 'text': translations[text]})
+            return json.dumps({'translations': rows}, ensure_ascii=False)
+    provider = PartialBatchReply()
+    out = segment_analysis.translate_for_display(provider, source, {'transcript_language': 'en'})
+    assert [s['display_text'] for s in out] == [text for _, text in sentences]
+    assert [(s['start_seconds'], s['end_seconds']) for s in out] == [
+        (s['start_seconds'], s['end_seconds']) for s in source]
+    assert provider.calls == 4

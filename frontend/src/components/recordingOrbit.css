@@ -1,0 +1,41 @@
+.capture-stage:has(.orbit-console) { padding: 0; background: #fff; color: #21362a; border: 1px solid var(--line); overflow: hidden; }
+.orbit-console { position: relative; display: grid; justify-items: center; gap: 10px; width: 100%; padding: 40px 14px 22px; border-radius: inherit; }
+.orbit-console .capture-device, .orbit-console .capture-status { position: absolute; top: 14px; font-size: 12px; color: #53665a; }
+.orbit-console .capture-device { left: 16px; }
+.orbit-console .capture-device svg { color: inherit; width: 15px; }
+.orbit-console .capture-status { right: 16px; }
+.orbit-switch { width: min(252px, 79%); position: relative; }
+.record-orbit { width: 100%; aspect-ratio: 1; position: relative; isolation: isolate; pointer-events: none; }
+.orbit-console .orbit-switch > button, .orbit-console .orbit-switch > button:hover {
+  position: absolute; inset: 5%; z-index: 1; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; box-shadow: none;
+}
+.record-orbit img, .record-orbit canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.record-orbit img {
+  mask-image: radial-gradient(ellipse 58% 65% at 46% 48%, #0005 0%, #0006 44%, #000a 65%, #000e 82%, #000 100%);
+}
+/* Soft window light on the glass, beneath the moving hoops. */
+.record-orbit::after {
+  content: ""; position: absolute; inset: 0; z-index: 1;
+  background: linear-gradient(145deg, #d3e7ddad 4%, #a4cabe38 43%, #abcbb524 72%, #dcca9e75);
+  mix-blend-mode: screen;
+  mask: url("../assets/orbit-glass.webp") center / contain no-repeat;
+}
+.record-orbit canvas { z-index: 2; }
+.record-orbit .orbit-shell, .record-orbit canvas, .record-orbit[data-live] img:first-child { visibility: hidden; }
+.record-orbit[data-live] .orbit-shell, .record-orbit[data-live] canvas { visibility: visible; }
+@media (prefers-reduced-motion: no-preference) {
+  .record-orbit[data-idle]:not([data-live]) { animation: orbit-breathe 7s ease-in-out infinite; }
+}
+@keyframes orbit-breathe { 50% { transform: scale(1.024); } }
+.orbit-time { font: 600 clamp(32px,4vw,44px)/1.05 Bahnschrift,"Segoe UI",sans-serif; font-variant-numeric: tabular-nums; letter-spacing: .015em; }
+.orbit-controls { display: inline-flex; align-items: center; padding: 3px 5px; border-radius: 30px; border: 1px solid var(--jade-edge); background: #f5f8f6; margin: 6px 0 0; }
+.orbit-controls button { display:inline-flex; align-items:center; gap:7px; justify-content:center; color: var(--jade-ink); background: transparent; border: 0; border-radius:22px; padding: 5px 10px; min-height:38px; box-shadow:none; }
+.orbit-controls button:hover:not(:disabled) { background: #e2ede5; color: #153c29; }
+.orbit-controls button + button { margin-left: 5px; position: relative; }
+.orbit-controls button + button::before { content:""; position:absolute; left:-3px; height:14px; width:1px; background:var(--jade-edge); }
+.orbit-controls svg { width:15px; height:15px; color:#93513d; }
+.orbit-controls button:first-child svg { box-sizing:content-box; padding:5px; background:#39634f; border-radius:50%; color:#f0f5eb; }
+.orbit-console .capture-checkpoint { color:#53665a; font-size:12px; }
+.capture-stage:has(.orbit-console) > [role=alert] { margin: 0 14px 14px; }
+

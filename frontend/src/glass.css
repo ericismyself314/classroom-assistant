@@ -209,7 +209,6 @@ input[type=range] { accent-color: var(--green); padding: 0; min-height: 28px; cu
 .chapter-body { min-width: 0; }
 .chapter-body .row { flex-wrap: wrap; }
 .chapter-summary { font-size: 13px; color: #758178; line-height: 1.95; }
-.note-point { border-radius: 12px; background: rgba(246,249,247,.6); }
 .note-sources { font-size: 11px; color: #929e95; }
 .reading-section-title { font-size: 18px; margin: 0 0 18px; }
 .session-reading-pane .transcript-fold { border: 0; padding: 0; }

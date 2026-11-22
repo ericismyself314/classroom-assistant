@@ -1,0 +1,62 @@
+.home-week { max-width: 1320px; margin-inline: auto; }
+.home-week > .surface-header { align-items: center; flex-wrap: nowrap; margin-bottom: 20px; }
+.home-week > .surface-header button { flex: none; }
+.home-week .home-schedule { container-type: inline-size; margin-bottom: 18px; }
+.home-week .panel-heading { margin-bottom: 14px; }
+.home-week .schedule-toolbar { flex-wrap: wrap; gap: 10px 16px; }
+.week-heading { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.home-week .week-picker { width: auto; min-width: 76px; min-height: 32px; padding: 4px 10px; color: #305b43; background: #edf4ef; border: 1px solid #d9e6dc; border-radius: 10px; font-size: 13px; font-weight: 600; }
+.week-heading > span, .week-agenda h3 time { color: #5f6863; font-size: 12px; font-weight: 450; }
+.week-actions { display: flex; align-items: center; gap: 10px; }
+.week-controls { display: inline-flex; align-items: center; flex: none; padding: 2px; border-radius: 11px; background: #f4f6f4; }
+.week-controls button { padding: 4px 8px; min-width: 28px; min-height: 28px; border: 0; border-radius: 9px; background: transparent; }
+.home-week .schedule-adjust { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 11px; color: #355944; border: 1px solid #d4dfd8; border-radius: 10px; }
+.schedule-notice { color: #365c45; font-size: 13px; margin: 0 0 12px; }
+.week-controls button:hover { background: #edf2ee; }
+.week-controls button:first-child svg { transform: rotate(180deg); }
+.week-matrix { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
+.week-time-column { width: 51px; }
+.week-matrix th, .week-matrix td { border: 0; padding: 0; }
+.week-matrix thead th { height: 40px; background: #f5f7f5; color: #4a554e; font-weight: 550; font-size: 13px; }
+.week-matrix thead th:first-child { border-radius: 8px 0 0 8px; }
+.week-matrix thead th:last-child { border-radius: 0 8px 8px 0; }
+.week-matrix thead time { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; margin-inline-start: 3px; border-radius: 6px; font-weight: 500; line-height: 23px; }
+.week-matrix thead [aria-current="date"] time { background: #286747; color: white; }
+.week-matrix tbody th { padding-right: 5px; color: #637169; font-size: 12px; font-weight: 500; }
+.week-matrix tbody td { padding: 5px 3px; vertical-align: top; }
+.week-matrix tbody tr + tr > * { border-top: 1px solid #e8ede9; }
+.week-matrix tbody td + td { border-left: 1px solid #f0f2f0; }
+.home-week .week-lesson { display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 4px; width: 100%; height: auto; padding: 9px 10px; min-width: 0; border: 1px solid #e3e8e5; border-radius: 12px; color: #25392d; background: #fff; text-align: left; box-shadow: none; white-space: normal; }
+.week-lesson + .week-lesson { margin-top: 4px; }
+.week-lesson-heading { display: flex; width: 100%; gap: 3px 7px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.week-lesson strong { color: #20372a; font-size: 14px; line-height: 1.4; overflow-wrap: anywhere; min-width: 0; }
+.week-lesson-time, .week-lesson-room { color: #52645a; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.week-lesson-time { font-variant-numeric: tabular-nums; font-size: 12px; color: #364b40; }
+.week-lesson-room { display: flex; align-items: baseline; gap: 4px; }
+.week-lesson-room svg { flex: none; align-self: center; }
+.home-week .week-lesson.is-next { background: #f8fbf9; border-color: #cadbd0; }
+.week-lesson-when { padding: 1px 6px; border-radius: 6px; background: #e4efe7; color: #315d42; font-size: 10px; line-height: 1.6; font-weight: 600; white-space: nowrap; }
+.home-week .week-lesson:not(:disabled):hover { background: #f1f6f2; border-color: #a9c1b1; }
+.week-agenda { display: none; }
+.week-empty { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid #e8ede9; padding-top: 10px; color: #626b64; }
+.home-week .recent-classes { margin: 0; }
+.home-week .recent-class-row { min-height: 52px; }
+.week-calibration { padding: 14px 16px; margin: 14px 0 20px; border-radius: 15px; background: #eef4ef; }
+.calibration-caption, .schedule-course-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.calibration-caption label, .schedule-course-heading h4 { font-size: 14px; color: #253a2c; font-weight: 600; margin: 0; }
+.calibration-caption time, .schedule-course-list small { color: #526459; font-size: 12px; }
+.calibration-entry { display: flex; gap: 7px; align-items: center; margin-top: 12px; }
+.calibration-entry input { width: 66px; font-variant-numeric: tabular-nums; }
+.calibration-entry button { margin-left: auto; }
+.schedule-course-list .course-list-item { justify-content: flex-start; }
+.schedule-course-list i { width: 8px; height: 8px; flex: none; border-radius: 50%; }
+.schedule-course-list .course-list-content { flex: 1; }
+.schedule-course-list .course-list-item svg { color: #617369; }
+@container (max-width: 600px) {
+  .week-matrix { display: none; }
+  .week-agenda { display: grid; gap: 10px; }
+  .week-agenda > section { display: grid; grid-template-columns: 68px minmax(0,1fr); gap: 9px; padding-top: 10px; border-top: 1px solid #e8ede9; }
+  .week-agenda h3 { display: flex; flex-direction: column; align-items: flex-start; margin: 4px 0; color: #354d3d; font-size: 13px; }
+  .week-agenda [aria-current="date"] { color: #286747; }
+  .week-heading { gap: 2px 8px; }
+}

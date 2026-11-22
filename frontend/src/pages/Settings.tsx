@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { localDateISO } from '../localDate';
+import { TranslationSettings } from '../components/TranslationSettings';
+import { AudioStorageSettings } from '../components/AudioStorageSettings';
 
 type SpeechState = {
   size: string; downloaded: boolean; valid?: boolean; detail?: string; missing_files?: string[];
@@ -27,11 +29,14 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
   const [data, setData] = useState<SettingsData | null>(null);
   const [status, setStatus] = useState<ModelStatus | null>(null);
   const [disk, setDisk] = useState<Disk | null>(null);
+  const [storageOpen, setStorageOpen] = useState(false);
   const [form, setForm] = useState<Record<string, string>>({});
   const [courses, setCourses] = useState<Array<{ id: string; name: string }>>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const pollRef = useRef<number | null>(null);
+  const loadId = useRef(0);
+  const [settingsVersion, setSettingsVersion] = useState(0);
 
   const [importCourseId, setImportCourseId] = useState('');
   const [importDate, setImportDate] = useState(localDateISO());
@@ -45,41 +50,39 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
   };
 
   const load = async () => {
+    const request = ++loadId.current;
     try {
       const [settingsData, modelState, appState, courseData] = await Promise.all([
         api.settings(), api.modelStatus(), api.state(), api.courses(),
       ]);
+      if (request !== loadId.current) return;
       setData(settingsData);
       setStatus(modelState);
       setDisk(appState.disk);
-      setForm({
-        ...settingsData.settings,
-        ai_provider: 'sidecar',
-        llm_model_id: 'qwen3-4b-q5_k_m',
-        whisper_tier: 'qwen',
-      });
+      setForm(settingsData.settings);
+      setSettingsVersion(current => current + 1);
       const list = (courseData.courses || []) as Array<{ id: string; name: string }>;
       setCourses(list);
       if (list.length) setImportCourseId((current) => current || list[0].id);
     } catch (error: any) {
-      flash('err', `设置加载失败：${error?.message || error}`);
+      if (request === loadId.current) flash('err', `设置加载失败：${error?.message || error}`);
     }
   };
 
   useEffect(() => {
     load();
-    return () => { if (pollRef.current) window.clearInterval(pollRef.current); };
+    return () => { loadId.current += 1; if (pollRef.current) window.clearInterval(pollRef.current); };
   }, []);
 
-  const saveCore = async (extra: Record<string, string> = {}) => {
-    const payload = {
-      ai_provider: 'sidecar',
-      llm_model_id: 'qwen3-4b-q5_k_m',
-      whisper_device: form.whisper_device || 'auto',
-      ...extra,
-    };
-    await api.saveSettings(payload);
-    setForm((old) => ({ ...old, ...payload }));
+  const changeDevice = async (value: string) => {
+    setBusy('device');
+    try {
+      await api.saveSettings({ whisper_device: value });
+      setForm(old => ({ ...old, whisper_device: value }));
+      flash('ok', '语音识别设备已保存');
+    } catch (error: any) {
+      flash('err', `保存失败：${error?.message || error}`);
+    } finally { setBusy(null); }
   };
 
   const startPoll = (target: 'speech' | 'text' | 'both') => {
@@ -113,10 +116,11 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
     if (!status) return;
     setBusy('prepare');
     try {
-      await saveCore();
+      const latest = await api.modelStatus();
+      setStatus(latest);
       const tasks: Promise<any>[] = [];
-      if (!status.whisper.qwen?.downloaded) tasks.push(api.downloadWhisper('Qwen3-ASR-0.6B'));
-      if (!(status.llm.sidecar.binary && status.llm.sidecar.model)) tasks.push(api.downloadLlm());
+      if (!latest.whisper.qwen?.downloaded) tasks.push(api.downloadWhisper('Qwen3-ASR-0.6B'));
+      if (!(latest.llm.sidecar.binary && latest.llm.sidecar.model)) tasks.push(api.downloadLlm());
       await Promise.all(tasks);
       if (!tasks.length) {
         setBusy(null);
@@ -134,7 +138,6 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
   const testSpeech = async () => {
     setBusy('speech-test');
     try {
-      await saveCore();
       const result = await api.testWhisper();
       if (!result.ok) throw new Error(result.error || '模型无法加载');
       flash('ok', `语音识别可用，实际使用 ${String(result.device || 'CPU').toUpperCase()}`);
@@ -146,7 +149,6 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
   const testText = async () => {
     setBusy('text-test');
     try {
-      await saveCore();
       const result = await api.testAnalysis();
       if (!result.ok) throw new Error(result.error || '模型无法完成最小整理任务');
       flash('ok', `文字整理可用：${result.label}`);
@@ -170,7 +172,6 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
   const downloadText = async () => {
     setBusy('text-download');
     try {
-      await saveCore();
       await api.downloadLlm();
       flash('ok', '已开始下载本地文字模型');
       startPoll('text');
@@ -185,7 +186,7 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
     try {
       await api.importModel(file, 'llm', 'qwen3-4b-q5_k_m');
       flash('ok', '文字模型导入成功');
-      await load();
+      setStatus(await api.modelStatus());
     } catch (error: any) {
       flash('err', `导入失败：${error?.message || error}`);
     } finally { setBusy(null); }
@@ -197,7 +198,7 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
     try {
       await api.deleteLlm();
       flash('ok', '文字整理模型已删除');
-      await load();
+      setStatus(await api.modelStatus());
     } catch (error: any) {
       flash('err', `删除失败：${error?.message || error}`);
     } finally { setBusy(null); }
@@ -245,25 +246,27 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
     } finally { setImportBusy(false); }
   };
 
-  if (!data || !status) return <div className="empty">正在读取本地状态…</div>;
+  if (!data || !status) return <div className="empty">{message?.kind === 'err'
+    ? <><p>{message.text}</p><button onClick={load}>重试</button></>
+    : '正在读取本地状态…'}</div>;
   const speech = status.whisper.qwen;
   const textReady = status.llm.sidecar.binary && status.llm.sidecar.model;
   const allReady = !!speech?.downloaded && textReady;
   const textModel = data.llm_models.find((item) => item.id === 'qwen3-4b-q5_k_m') || data.llm_models[0];
-  const selectedDeviceLabel = data.whisper_device_options.find((item) => item.value === (form.whisper_device || 'auto'))?.label || '自动';
 
   return (
     <div className="settings-page">
       <h2 className="page-title">设置</h2>
-      <p className="page-sub">两步都在本机完成：千问听录音，本地大模型整理文字。</p>
+      <p className="page-sub">设置转写翻译方式、语音识别设备和课堂备份。</p>
 
-      {message && <div className={`hint ${message.kind === 'err' ? 'settings-error' : ''}`}>{message.text}</div>}
+      {message && <div className={`hint ${message.kind === 'err' ? 'settings-error' : ''}`} role={message.kind === 'err' ? 'alert' : 'status'}>{message.text}</div>}
+
+      <TranslationSettings key={settingsVersion} initial={data.settings} disabled={busy === 'restore'} />
 
       <div className="card setup-card settings-ready-card">
         <div>
-          <div className="settings-eyebrow">当前处理链路</div>
-          <h3>{allReady ? '已经可以处理课堂录音' : '还差一步准备'}</h3>
-          <p>Qwen3-ASR {speech?.downloaded ? '✓' : '未就绪'}　→　Qwen3-4B 文字整理 {textReady ? '✓' : '未就绪'}</p>
+          <h3>{allReady ? '本机模型已就绪' : '准备本机模型'}</h3>
+          <p>语音识别{speech?.downloaded ? '已就绪' : '待下载'}，文字整理{textReady ? '已就绪' : '待下载'}。</p>
         </div>
         <button className="primary" disabled={busy !== null} onClick={prepare}>
           {busy === 'prepare' ? '正在准备…' : allReady ? '重新检查' : '一键准备'}
@@ -272,40 +275,36 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
 
       <div className="settings-model-grid">
         <section className="card model-card">
-          <div className="model-step">1</div>
           <div className="model-card-head">
-            <div><span className="settings-eyebrow">把声音变成原文</span><h3>千问语音识别</h3></div>
+            <h3>语音识别</h3>
             <span className={`badge ${speech?.downloaded ? 'green' : 'warn'}`}>{speech?.downloaded ? '已就绪' : '待准备'}</span>
           </div>
-          <p className="muted">固定使用 Qwen3-ASR-0.6B，不再保留容易混淆的多档语音模型。</p>
-          <div className="settings-fact"><span>运行位置</span><b>本机，不上传录音</b></div>
-          <div className="settings-fact"><span>设备</span><b>{selectedDeviceLabel}</b></div>
-          <label>运行方式</label>
-          <select value={form.whisper_device || 'auto'} onChange={(event) => setForm({ ...form, whisper_device: event.target.value })}>
+          <p className="muted">千问在本机将课堂录音转成带时间的原文。</p>
+          <div className="settings-fact"><span>模型</span><b>Qwen3-ASR-0.6B</b></div>
+          <label htmlFor="speech-device">运行设备</label>
+          <select id="speech-device" disabled={busy !== null} value={form.whisper_device || 'auto'} onChange={(event) => void changeDevice(event.target.value)}>
             {data.whisper_device_options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
           {!speech?.downloaded && <div className="small settings-detail">{speech?.detail || '模型尚未下载'}</div>}
           <div className="row wrap model-actions">
             {!speech?.downloaded && <button className="primary" disabled={busy !== null} onClick={downloadSpeech}>下载语音模型</button>}
-            <button disabled={busy !== null || !speech?.downloaded} onClick={testSpeech}>{busy === 'speech-test' ? '正在加载…' : '测试实际加载'}</button>
+            <button disabled={busy !== null || !speech?.downloaded} onClick={testSpeech}>{busy === 'speech-test' ? '正在加载…' : '测试语音识别'}</button>
             <button disabled={busy !== null} onClick={async () => { const r = await api.validateWhisper(); flash(r.ok ? 'ok' : 'err', r.ok ? '语音模型文件完整' : '语音模型文件不完整'); }}>校验文件</button>
           </div>
           <p className="small muted">第一次测试会加载约 1.8 GB 模型，可能需要几十秒；以后会复用同一服务。</p>
         </section>
 
         <section className="card model-card">
-          <div className="model-step">2</div>
           <div className="model-card-head">
-            <div><span className="settings-eyebrow">把原文变成课堂笔记</span><h3>本地文字整理</h3></div>
+            <h3>本地文字整理</h3>
             <span className={`badge ${textReady ? 'green' : 'warn'}`}>{textReady ? '已就绪' : '待准备'}</span>
           </div>
-          <p className="muted">提取章节、重点、作业与日期，并为英文课堂生成中文展示；原始转写始终保留。</p>
+          <p className="muted">{form.ai_provider === 'openai' ? '当前笔记沿用此前选定的整理 API。下方可以准备和测试本机模型。' : form.ai_provider === 'ollama' ? '当前笔记使用本机 Ollama 整理。下方可以准备和测试内置模型。' : '从课堂转写中整理章节、重点、作业和日期。'}</p>
           <div className="settings-fact"><span>模型</span><b>{textModel?.display || 'Qwen3-4B'}</b></div>
           <div className="settings-fact"><span>大小</span><b>{textModel ? fmtSize(textModel.size_bytes) : '约 2.9 GB'}</b></div>
-          <div className="settings-fact"><span>运行位置</span><b>本机 llama.cpp</b></div>
           <div className="row wrap model-actions">
             {!textReady && <button className="primary" disabled={busy !== null} onClick={downloadText}>下载文字模型</button>}
-            <button disabled={busy !== null || !textReady} onClick={testText}>{busy === 'text-test' ? '正在整理测试文字…' : '测试实际整理'}</button>
+            <button disabled={busy !== null || !textReady} onClick={testText}>{busy === 'text-test' ? '正在整理测试文字…' : '测试本机文字整理'}</button>
           </div>
           <details className="advanced">
             <summary>模型文件管理</summary>
@@ -335,18 +334,17 @@ export function Settings({ navigate }: { navigate: (v: any) => void }) {
         </div>
       </details>
 
-      <details className="card settings-section">
-        <summary><b>数据、备份与空间</b><span className="muted">课堂数据与模型都只保存在本机</span></summary>
+      <details className="card settings-section" onToggle={event => setStorageOpen(event.currentTarget.open)}>
+        <summary><b>录音空间与备份</b><span className="muted">压缩录音、保留期限和本机备份</span></summary>
         <div className="settings-inner">
+          {storageOpen && <AudioStorageSettings formatSize={fmtSize} onFinished={() => {
+            api.state().then(result => setDisk(result.disk)).catch(() => {});
+          }} />}
           {disk && <div className="kv"><div>数据目录</div><div className="path-value">{disk.data_dir}</div><div>课堂音频</div><div>{fmtSize(disk.audio_bytes)}</div><div>模型</div><div>{fmtSize(disk.models_bytes)}</div><div>总占用</div><div>{fmtSize(disk.total_bytes)}</div></div>}
           <div className="row wrap model-actions"><button onClick={() => api.openDataFolder()}>打开数据文件夹</button><button onClick={backup}>导出备份</button><label className="btn ghost file-button">恢复备份<input type="file" accept=".zip" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) restore(file); event.currentTarget.value = ''; }} /></label></div>
         </div>
       </details>
 
-      <div className="settings-save-bar">
-        <span className="small muted">更改运行方式后保存；测试按钮也会自动保存。</span>
-        <button className="primary" disabled={busy !== null} onClick={async () => { setBusy('save'); try { await saveCore(); flash('ok', '设置已保存'); } catch (error: any) { flash('err', `保存失败：${error?.message || error}`); } finally { setBusy(null); } }}>{busy === 'save' ? '保存中…' : '保存设置'}</button>
-      </div>
     </div>
   );
 }

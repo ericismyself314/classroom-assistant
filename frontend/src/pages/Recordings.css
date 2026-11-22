@@ -1,0 +1,50 @@
+.recording-library { max-width: 1140px; margin: 0 auto; }
+.recordings-header, .recordings-heading, .recordings-footer, .recording-file-line, .recordings-actions, .recordings-tabs, .recordings-selectors, .recordings-recover-file { display: flex; align-items: center; gap: 10px; }
+.recordings-header, .recordings-heading, .recordings-footer { justify-content: space-between; }
+.recordings-header h1, .recordings-header p, .recordings-heading h2, .recordings-heading p { margin: 0; }
+.recordings-header p { margin-top: 5px; }
+.recordings-header button { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+.recording-library .recordings-filters { padding: 16px 20px; margin-bottom: 18px; }
+.recordings-selectors { flex-wrap: wrap; }
+.recordings-search { display: flex; align-items: center; gap: 8px; flex: 1 1 250px; border: 1px solid var(--line); border-radius: 10px; padding: 0 10px; color: var(--ink-2); }
+.recordings-search input { flex: 1; min-width: 0; border: 0; background: transparent; }
+.recordings-search:focus-within { outline: 2px solid var(--green); outline-offset: 2px; }
+.recordings-search input:focus { outline: 0; box-shadow: none; }
+.recordings-selectors select { min-width: 100px; max-width: min(260px,100%); }
+.recordings-tabs { margin-top: 12px; gap: 4px; flex-wrap: wrap; }
+.recordings-tabs button { min-height: 30px; border-color: transparent; background: transparent; color: var(--ink-2); }
+.recordings-tabs button[aria-pressed=true] { background: var(--green-soft); color: var(--green); font-weight: 600; }
+.recordings-tabs .recordings-clear { margin-left: auto; text-decoration: underline; }
+.recordings-session, .recordings-draft { margin-bottom: 14px; }
+.recordings-heading { align-items: flex-start; }
+.recordings-heading h2 { margin-top: 4px; font-size: 18px; line-height: 1.35; overflow-wrap: anywhere; }
+.recordings-meta, .recording-file-title span { color: var(--ink-2); font-size: 12px; }
+.recordings-state { flex-shrink: 0; padding: 3px 9px; border-radius: 6px; color: #385a72; background: #eef3f7; font-size: 12px; }
+.recordings-state.complete { background: var(--green-soft); color: var(--green); }
+.recordings-state.recovery { color: #835527; background: #faf1e0; }
+.recordings-files { padding: 0; margin: 15px 0 12px; list-style: none; }
+.recordings-files li { padding: 12px 0; border-top: 1px solid var(--line); }
+.recording-file-icon { display: grid; place-items: center; width: 34px; height: 34px; background: var(--green-soft); color: var(--green); border-radius: 9px; flex-shrink: 0; }
+.recording-file-title { display: flex; flex-direction: column; flex: 1; min-width: 110px; overflow-wrap: anywhere; }
+.recording-file-title strong { font-size: 14px; font-weight: 600; }
+.recording-inline-player { margin: 11px 0 0; }
+.recording-inline-player audio { width: 100%; height: 38px; }
+.recordings-actions { gap: 7px; flex-wrap: wrap; }
+.recording-reveal { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.recordings-problem, .recording-action-error, .recording-inline-player [role=alert] { color: #8c462d; font-size: 12px; }
+.recordings-recover-file { margin-top: 8px; color: #805827; font-size: 12px; }
+.recordings-draft-notice { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 14px; color: #805827; font-size: 13px; }
+.recordings-footer { border-top: 1px solid var(--line); padding-top: 13px; flex-wrap: wrap; }
+.recordings-empty { text-align: center; padding: 40px 20px; color: var(--ink-2); }
+.recordings-empty h2 { font-size: 17px; }
+.recordings-empty svg { width: 30px; height: 30px; color: #779484; }
+.recording-receipt { margin: 0; }
+.recording-receipt h3, .recording-receipt p { margin: 0 0 8px; }
+.recording-receipt .recordings-actions { margin-top: 14px; }
+.recording-receipt .recording-file-title { margin: 10px 0 12px; }
+@media (max-width: 760px) {
+  .recording-file-line { flex-wrap: wrap; }
+  .recording-file-line .recordings-actions { width: 100%; }
+  .recordings-footer { align-items: flex-start; }
+  .recordings-selectors { gap: 6px; }
+}

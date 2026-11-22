@@ -1,5 +1,6 @@
 """回归测试：文字导入、PyAV 时长换算和模型就绪判断。"""
 import wave
+from unittest.mock import patch
 
 import pytest
 
@@ -40,6 +41,23 @@ def test_audio_duration_uses_pyav_timebase(tmp_path):
         stream.writeframes(b"\x00\x00" * 16000)
 
     assert hashutil.audio_duration_seconds(str(audio)) == pytest.approx(1.0, abs=0.05)
+
+
+def test_saving_then_processing_reuses_duration_until_the_file_changes(tmp_path):
+    av = pytest.importorskip("av")
+    audio = tmp_path / "recording.wav"
+    def write(seconds):
+        with wave.open(str(audio), "wb") as stream:
+            stream.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            stream.writeframes(b"\x00\x00" * 8000 * seconds)
+    with patch.object(av, "open", wraps=av.open) as decoder:
+        write(2)
+        assert hashutil.audio_duration_seconds(str(audio)) == 2
+        assert hashutil.audio_duration_seconds(str(audio)) == 2
+        assert decoder.call_count == 1
+        write(3)
+        assert hashutil.audio_duration_seconds(str(audio)) == 3
+        assert decoder.call_count == 2
 
 
 @pytest.mark.parametrize(

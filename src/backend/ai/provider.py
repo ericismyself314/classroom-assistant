@@ -7,7 +7,7 @@ from __future__ import annotations
 import threading
 import time
 
-from ..credential import get_credential
+from .. import credential
 from ..logutil import get_logger
 from . import manifest
 from .llm_provider import (
@@ -15,6 +15,9 @@ from .llm_provider import (
     LlamaCppSidecarLLM,
     OllamaLLM,
     OpenAICompatibleLLM,
+    api_identity,
+    normalize_api_endpoint,
+    normalize_api_model,
 )
 
 LOG = get_logger("provider")
@@ -44,6 +47,12 @@ def _ollama_status(model: str) -> tuple[bool, list[str]]:
         return available, models
 
 
+def legacy_api_connection(settings):
+    base = normalize_api_endpoint(settings.get("openai_base_url") or "https://api.openai.com/v1")
+    model = normalize_api_model(settings.get("openai_model") or "gpt-4o-mini")
+    return base, model, api_identity(base, model)
+
+
 def build_provider(settings: dict) -> BaseLLM:
     """根据设置构造一个可用的 Provider 实例。
 
@@ -63,14 +72,12 @@ def build_provider(settings: dict) -> BaseLLM:
         if ol.available():
             return ol
 
-    if provider_type in ("openai", "auto"):
-        key = get_credential("openai_api_key")
+    if provider_type == "openai":
+        base, model, scope = legacy_api_connection(settings)
+        key = credential.get_credential("openai_api_key", scope, allow_legacy=True)
         if key:
-            return OpenAICompatibleLLM(
-                (settings or {}).get("openai_base_url", "https://api.openai.com/v1"),
-                key,
-                (settings or {}).get("openai_model", "gpt-4o-mini"),
-            )
+            return OpenAICompatibleLLM(base, key, model)
+        raise ValueError("原有文字整理 API 的密钥不可用，请检查整理方式。")
 
     # 兜底：返回 sidecar 对象（前端会引导下载模型）
     return LlamaCppSidecarLLM(llm_model_id)
@@ -78,15 +85,23 @@ def build_provider(settings: dict) -> BaseLLM:
 
 def detect_status(settings: dict) -> dict:
     """返回各 Provider 可用性，供设置页展示。"""
+    settings = settings or {}
     llm_model_id = (settings or {}).get("llm_model_id") or manifest.default_llm_model()["id"]
     sidecar = LlamaCppSidecarLLM(llm_model_id)
     # The supported default is the bundled local sidecar. Avoid probing an
     # optional Ollama service whenever Settings opens; that made the page slow.
     pref = str((settings or {}).get("ai_provider") or "sidecar").lower()
-    if pref == "ollama":
+    if pref == "ollama" or (settings.get("ai_provider") == "auto" and not sidecar.available()):
         ollama_available, ollama_models = _ollama_status((settings or {}).get("ollama_model") or "")
     else:
         ollama_available, ollama_models = False, []
+    legacy_configured = False
+    if pref == "openai":
+        try:
+            _, _, scope = legacy_api_connection(settings)
+            legacy_configured = credential.has_credential("openai_api_key", scope, allow_legacy=True)
+        except ValueError:
+            pass
     return {
         "sidecar": {
             "available": sidecar.available(),
@@ -98,7 +113,7 @@ def detect_status(settings: dict) -> dict:
             "available": ollama_available,
             "models": ollama_models,
         },
-        "openai": {"configured": bool(get_credential("openai_api_key"))},
+        "openai": {"configured": legacy_configured},
     }
 
 
@@ -125,4 +140,4 @@ def provider_is_ready(settings: dict, status: dict | None = None) -> bool:
         return ollama_ready
     if pref == "openai":
         return openai_ready
-    return sidecar_ready or ollama_ready or openai_ready
+    return sidecar_ready or ollama_ready

@@ -9,15 +9,17 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .. import dateparse, important, schemas
 from ..logutil import get_logger
 from . import prompts, note_quality, coverage
+from .llm_provider import TranslationAPIError
 
 LOG = get_logger("analysis")
 
 
-def _needs_chinese_display(segments: list[dict], session_meta: dict) -> bool:
+def needs_chinese_display(segments: list[dict], session_meta: dict) -> bool:
     """只在英文/混合课堂（或明显英文的文字导入）调用翻译模型。"""
     language = str(session_meta.get("transcript_language") or "").lower()
     if language in {"en", "mix"}:
@@ -35,6 +37,8 @@ def _translation_rows(raw) -> dict[int, str] | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("translations"), list):
         return None
     result: dict[int, str] = {}
+    seen = set()
+    duplicates = set()
     for row in raw["translations"]:
         if not isinstance(row, dict):
             continue
@@ -42,10 +46,65 @@ def _translation_rows(raw) -> dict[int, str] | None:
             index = int(row.get("index"))
         except (TypeError, ValueError):
             continue
+        if index in seen:
+            duplicates.add(index)
+        seen.add(index)
         text = str(row.get("text") or "").strip()
         if index >= 0 and text:
             result[index] = text
+    for index in duplicates:
+        result.pop(index, None)
     return result or None
+
+
+def _partial_translation_rows(text) -> dict[int, str] | None:
+    """Recover complete array entries when a translation JSON reply is truncated."""
+    if not isinstance(text, str):
+        return None
+    start = re.match(r'^\s*\{\s*"translations"\s*:\s*\[', text)
+    if not start:
+        return None
+    decoder = json.JSONDecoder()
+    position = start.end()
+    rows = []
+    while True:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        try:
+            row, end = decoder.raw_decode(text, position)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(row, dict):
+            break
+        position = end
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position < len(text) and text[position] not in ',]':
+            break
+        rows.append(row)
+        if position == len(text) or text[position] == ']':
+            break
+        position += 1
+    recovered = {}
+    duplicates = set()
+    seen = set()
+    for row in rows:
+        index = row.get("index")
+        if type(index) is int:
+            pass
+        elif isinstance(index, str) and index.isdecimal():
+            index = int(index)
+        else:
+            continue
+        if index in seen:
+            duplicates.add(index)
+        seen.add(index)
+        value = row.get("text")
+        if index >= 0 and isinstance(value, str) and value.strip():
+            recovered[index] = value.strip()
+    for index in duplicates:
+        recovered.pop(index, None)
+    return recovered or None
 
 
 def _single_translation_text(data) -> str | None:
@@ -59,29 +118,43 @@ def _single_translation_text(data) -> str | None:
     return None
 
 
-def _translate_chunk(provider, chunk: list[dict], offset: int, retries: int = 2) -> dict[int, str]:
+def _translation_reply_rows(response):
+    return (_translation_rows(schemas._extract_json(response)) or
+            _partial_translation_rows(response))
+
+
+def _translation_input(provider, segments, start_index=0):
+    if getattr(provider, "name", None) == "translation_api":
+        return "\n".join(f"[{i}] {s['text']}" for i, s in enumerate(segments, start_index))
+    return _fmt_segments(segments, start_index)
+
+
+def _translate_chunk(provider, chunk: list[dict], offset: int, retries: int = 2, cache=None) -> dict[int, str]:
     """翻译一个块，返回 {全局编号: 中文}。整块都翻不出时返回 {}。
 
     本地小模型（如 Qwen3-4B）翻译大段经常丢条目或返回截断 JSON。这里整块重试几次；
     仍缺失的片段交给调用方逐段补翻，因此「一个块失败」绝不会拖累整节课。
     """
+    user = prompts.TRANSLATION_PROMPT.format(segments=_translation_input(provider, chunk))
+    key = cache.key(provider, prompts.TRANSLATION_SYSTEM, user, json_mode=True, temperature=0) if cache else None
     for attempt in range(retries):
         try:
-            response = provider.chat(
-                prompts.TRANSLATION_SYSTEM,
-                prompts.TRANSLATION_PROMPT.format(segments=_fmt_segments(chunk, offset)),
-                json_mode=True,
-                temperature=0,
-            )
-            rows = _translation_rows(schemas._extract_json(response))
+            response = cache.get(key, lambda value: any(
+                0 <= i < len(chunk) for i in (_translation_reply_rows(value) or {}))) if cache else None
+            if response is None:
+                response = provider.chat(prompts.TRANSLATION_SYSTEM, user, json_mode=True, temperature=0)
+            rows = _translation_reply_rows(response)
+        except (InterruptedError, TranslationAPIError):
+            raise
         except Exception as exc:  # noqa: BLE001
             LOG.warning("中文展示稿整块翻译调用失败（尝试 %d/%d）offset=%d: %s",
                         attempt + 1, retries, offset, exc)
             continue
         if rows:
-            expected = set(range(offset, offset + len(chunk)))
-            valid = {i: t for i, t in rows.items() if i in expected and str(t).strip()}
+            valid = {offset + i: t for i, t in rows.items() if 0 <= i < len(chunk) and str(t).strip()}
             if valid:
+                if cache:
+                    cache.put(key, response)
                 return valid
             LOG.warning("中文展示稿整块翻译返回不完整（尝试 %d/%d）offset=%d，转交逐段补翻",
                         attempt + 1, retries, offset)
@@ -90,22 +163,26 @@ def _translate_chunk(provider, chunk: list[dict], offset: int, retries: int = 2)
     return {}
 
 
-def _translate_one_short(provider, segment: dict, global_index: int, retries: int = 3) -> str | None:
+def _translate_one_short(provider, segment: dict, global_index: int, retries: int = 3, cache=None) -> str | None:
     """翻译单个片段。小模型对单段最稳，用于补翻整块翻译漏掉的条目。"""
-    line = _fmt_segments([segment], global_index)
+    line = _translation_input(provider, [segment], global_index)
+    user = prompts.TRANSLATION_PROMPT.format(segments=line)
+    key = cache.key(provider, prompts.TRANSLATION_SYSTEM, user, json_mode=True, temperature=0) if cache else None
     for attempt in range(retries):
         try:
-            response = provider.chat(
-                prompts.TRANSLATION_SYSTEM,
-                prompts.TRANSLATION_PROMPT.format(segments=line),
-                json_mode=True,
-                temperature=0,
-            )
+            response = cache.get(key, lambda value: _single_translation_text(
+                schemas._extract_json(value))) if cache else None
+            if response is None:
+                response = provider.chat(prompts.TRANSLATION_SYSTEM, user, json_mode=True, temperature=0)
             text = _single_translation_text(schemas._extract_json(response))
+        except (InterruptedError, TranslationAPIError):
+            raise
         except Exception as exc:  # noqa: BLE001
             LOG.warning("单段翻译调用失败（尝试 %d/%d）seg=%d: %s", attempt + 1, retries, global_index, exc)
             continue
         if text:
+            if cache:
+                cache.put(key, response)
             return text
     return None
 
@@ -128,19 +205,19 @@ def _translation_parts(text: str, max_chars: int = 260) -> list[str]:
     return parts
 
 
-def _translate_one(provider, segment: dict, global_index: int, retries: int = 3) -> str | None:
+def _translate_one(provider, segment: dict, global_index: int, retries: int = 3, cache=None) -> str | None:
     """Translate one source segment, including old oversized Qwen segments."""
     parts = _translation_parts(segment.get("text", ""))
     translated = []
     for part in parts:
-        text = _translate_one_short(provider, {**segment, "text": part}, global_index, retries)
+        text = _translate_one_short(provider, {**segment, "text": part}, global_index, retries, cache=cache)
         if not text:
             return None
         translated.append(text)
     return "".join(translated) if translated else None
 
 
-def translate_for_display(provider, segments: list[dict], session_meta: dict, progress_cb=None) -> list[dict]:
+def translate_for_display(provider, segments: list[dict], session_meta: dict, progress_cb=None, cache=None) -> list[dict]:
     """Return Chinese display copies without overwriting the ASR source text.
 
     ``text`` remains the recoverable original in SQLite. The returned copies use
@@ -153,7 +230,7 @@ def translate_for_display(provider, segments: list[dict], session_meta: dict, pr
     """
     if not segments:
         return []
-    if not _needs_chinese_display(segments, session_meta):
+    if not needs_chinese_display(segments, session_meta):
         return [{**s, "display_text": s.get("text"), "text": s.get("text", "")} for s in segments]
     if provider is None:
         raise RuntimeError("英文转写需要可用的本地文字模型来生成中文展示稿")
@@ -163,16 +240,34 @@ def translate_for_display(provider, segments: list[dict], session_meta: dict, pr
     chunks = split_segments(segments, max_chars=2600)
     offset = 0
     for ci, chunk in enumerate(chunks):
+        label = f"翻译第 {ci + 1}/{len(chunks)} 块"
         if progress_cb:
-            progress_cb("翻译为中文展示稿", ci / max(len(chunks), 1))
-        rows = _translate_chunk(provider, chunk, offset)
+            progress_cb(label, offset / total)
+        rows = _translate_chunk(provider, chunk, offset, cache=cache)
         translated.update(rows)
+        processed = offset + len(rows)
+        if progress_cb and rows:
+            progress_cb(label, processed / total)
+        missing = [i for i in range(offset, offset + len(chunk)) if i not in translated]
+        # A partial reply may omit several entries: batch just those before
+        # falling back to individual requests, retaining their original order.
+        if rows and len(missing) >= 3:
+            batch = _translate_chunk(provider, [segments[i] for i in missing], 0, retries=1, cache=cache)
+            translated.update({missing[i]: text for i, text in batch.items()})
+            processed += len(batch)
+            if progress_cb and batch:
+                progress_cb(label, processed / total)
         # 逐段补翻本块仍缺失的片段（小模型对单段最稳）
         for i in range(offset, offset + len(chunk)):
             if i not in translated:
-                t = _translate_one(provider, segments[i], i)
+                t = _translate_one(provider, segments[i], i, cache=cache)
                 if t:
                     translated[i] = t
+                elif getattr(provider, "name", None) == "translation_api":
+                    raise TranslationAPIError("API 遗漏了课堂片段，补译后仍无结果。请检查模型后继续。")
+                processed += 1
+                if progress_cb:
+                    progress_cb(f"补译第 {ci + 1}/{len(chunks)} 块", processed / total)
         offset += len(chunk)
 
     out = []
@@ -251,6 +346,18 @@ def _chunk_result(parsed):
     if not isinstance(parsed, dict) or not isinstance(parsed.get("topics"), list):
         return None
     return {**parsed, "items": parsed.get("items") if isinstance(parsed.get("items"), list) else []}
+
+
+def _cacheable_analysis_reply(response, window, offset, session_meta):
+    raw = _chunk_result(schemas._extract_json(response))
+    if raw is None:
+        return False
+    accepted, _, dropped = note_quality.review_topics(None, raw['topics'], window, offset)
+    if not accepted or dropped:
+        return False
+    with_evidence = {**raw, 'items': _evidence_items(raw['items'], window, offset)}
+    _, error = schemas.normalize_items(with_evidence, session_meta['session_date'])
+    return not error
 
 
 def _add_chunk_bounds(topics: list[dict], chunk: list[dict]) -> list[dict]:
@@ -378,7 +485,13 @@ def _fallback_notes(course: str, topics: list[dict]) -> dict:
     }
 
 
-def _synthesize(provider, topics: list[dict], session_meta: dict) -> dict:
+def _cacheable_synthesis_reply(response, fallback):
+    raw = schemas._extract_json(response)
+    clean = _clean_synthesis(raw, fallback)
+    return bool(clean and all(len(clean[key]) == len(raw[key]) for key in ('timeline', 'knowledge')))
+
+
+def _synthesize(provider, topics: list[dict], session_meta: dict, cache=None) -> dict:
     fallback = _fallback_notes(session_meta.get("course_name", ""), topics)
     if provider is None or not topics:
         return fallback
@@ -388,14 +501,20 @@ def _synthesize(provider, topics: list[dict], session_meta: dict) -> dict:
         "points": [{"text": p.get("text"), "important": p.get("important", False)} for p in (t.get("points") or [])],
         "start_seconds": t.get("start_seconds"), "end_seconds": t.get("end_seconds"),
     } for t in topics], ensure_ascii=False)
+    system = prompts.SYNTHESIS_SYSTEM.format()
+    user = prompts.SYNTHESIS_PROMPT.format(course=session_meta.get("course_name", ""),
+                                          class_date=session_meta["session_date"], drafts=drafts)
+    key = cache.key(provider, system, user, json_mode=True, temperature=0.1) if cache else None
     try:
-        raw = schemas._extract_json(provider.chat(
-            prompts.SYNTHESIS_SYSTEM.format(),
-            prompts.SYNTHESIS_PROMPT.format(course=session_meta.get("course_name", ""),
-                                            class_date=session_meta["session_date"], drafts=drafts),
-            json_mode=True, temperature=0.1))
+        response = cache.get(key, lambda value: _cacheable_synthesis_reply(
+            value, _coarse_topics(topics))) if cache else None
+        if response is None:
+            response = provider.chat(system, user, json_mode=True, temperature=0.1)
+        raw = schemas._extract_json(response)
         merged = _clean_synthesis(raw, _coarse_topics(topics))
         if merged:
+            if cache and _cacheable_synthesis_reply(response, _coarse_topics(topics)):
+                cache.put(key, response)
             return {**fallback, **merged, "chapters": merged["knowledge"]}
     except InterruptedError:
         raise
@@ -404,7 +523,7 @@ def _synthesize(provider, topics: list[dict], session_meta: dict) -> dict:
     return fallback
 
 
-def analyze_session(provider, segments: list[dict], session_meta: dict, progress_cb=None):
+def analyze_session(provider, segments: list[dict], session_meta: dict, progress_cb=None, cache=None):
     """返回 (overview, items)。
 
     overview = {"overview_title", "topics": [...]}
@@ -421,7 +540,7 @@ def analyze_session(provider, segments: list[dict], session_meta: dict, progress
     offset = 0
     for ci, chunk in enumerate(chunks):
         if progress_cb:
-            progress_cb("analyzing", (ci / max(len(chunks), 1)) if chunks else 1.0)
+            progress_cb(f"整理第 {ci + 1}/{len(chunks)} 块", offset / len(segments))
         lo, hi = coverage.context_window(segments, offset, offset + len(chunk))
         window = segments[lo:hi]
         user = prompts.CHUNK_PROMPT.format(
@@ -432,7 +551,18 @@ def analyze_session(provider, segments: list[dict], session_meta: dict, progress
         raw = None
         for attempt in range(2):
             try:
-                response = provider.chat(system, user, json_mode=True, temperature=0.2 if attempt == 0 else 0)
+                temperature = 0.2 if attempt == 0 else 0
+                key = cache.key(provider, system, user, json_mode=True, temperature=temperature) if cache else None
+                response = cache.get(key, lambda value: _cacheable_analysis_reply(
+                    value, window, lo, session_meta)) if cache else None
+                if cache and attempt == 0 and response is None:
+                    retry_key = cache.key(provider, system, user, json_mode=True, temperature=0)
+                    response = cache.get(retry_key, lambda value: _cacheable_analysis_reply(
+                        value, window, lo, session_meta))
+                    if response is not None:
+                        key = retry_key
+                if response is None:
+                    response = provider.chat(system, user, json_mode=True, temperature=temperature)
                 raw = _chunk_result(schemas._extract_json(response))
                 if raw is not None:
                     break
@@ -441,10 +571,12 @@ def analyze_session(provider, segments: list[dict], session_meta: dict, progress
                 raise
             except Exception as e:  # noqa: BLE001
                 LOG.warning("分段 %d 分析调用失败，尝试 %d/2: %s", ci, attempt + 1, e)
+        successful_reply = raw is not None
         if raw is None:
             LOG.warning("分段 %d 未返回可用 JSON；保留该段原文作为笔记", ci)
             raw = {"topics": [_fallback_topic(chunk, ci)], "items": []}
         accepted, pending, dropped = note_quality.review_topics(provider, raw["topics"], window, lo)
+        cacheable = successful_reply and bool(accepted) and not dropped
         if not accepted:
             accepted = [_fallback_topic(chunk, ci)]
         accepted = _add_chunk_bounds(accepted, chunk)
@@ -453,6 +585,8 @@ def analyze_session(provider, segments: list[dict], session_meta: dict, progress
         rejected += dropped
         raw_with_evidence = {**raw, "items": _evidence_items(raw.get("items") or [], window, lo)}
         its, its_err = schemas.normalize_items(raw_with_evidence, session_meta["session_date"])
+        if cache and cacheable and not its_err:
+            cache.put(key, response)
         if its:
             all_items.extend(its)
         elif its_err:
@@ -468,7 +602,7 @@ def analyze_session(provider, segments: list[dict], session_meta: dict, progress
     final_items = _finalize(provider, all_items, session_meta)
     final_items = schemas.apply_date_normalization(final_items, session_meta["session_date"])
 
-    notes = _synthesize(provider, all_topics, session_meta)
+    notes = _synthesize(provider, all_topics, session_meta, cache=cache)
     chapters = notes.get("knowledge") or notes.get("chapters") or []
     notes.update({"review": review, "coverage": coverage_stats,
                   "rejected_count": rejected,

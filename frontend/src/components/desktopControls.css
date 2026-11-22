@@ -1,0 +1,21 @@
+.desktop-controls { position: fixed; z-index: 10000; top: 0; right: 1px; display: flex; }
+.desktop-controls button { display: grid; place-items: center; width: 40px; height: 25px; min-height: 0; padding: 0; color: #4c544f; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.desktop-controls button:hover { background: #e2e7e3; }
+.desktop-controls .desktop-close:hover { color: white; background: #bc3535; }
+.desktop-controls:not([data-maximized]) { top: 4px; right: 8px; gap: 2px; }
+.desktop-controls:not([data-maximized]) button { width: 36px; height: 24px; border-radius: 7px; }
+.desktop-controls svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.25; }
+.desktop-drag-area { position: fixed; z-index: 9999; top: 0; right: 122px; left: 0; height: 28px; }
+.desktop-resize-top { position: fixed; z-index: 10001; inset: 0 0 auto; height: 4px; cursor: ns-resize; touch-action: none; }
+.desktop-frame :is(.desktop-drag-area, .sidebar .brand, .surface-header, .audio-workspace-header, .session-heading, .welcome-hero, .page-title) {
+  -webkit-app-region: drag; app-region: drag; user-select: none;
+}
+.desktop-frame .sidebar .brand img { -webkit-user-drag: none; }
+.desktop-frame :is(.surface-header, .audio-workspace-header, .session-heading, .welcome-hero, .page-title) :is(button, a, input, select, textarea, label, summary, [role="button"], [contenteditable="true"]),
+.desktop-frame :is(.desktop-controls, .desktop-resize-top, .modal-mask, .session-menu) {
+  -webkit-app-region: no-drag; app-region: no-drag;
+}
+.desktop-frame .content { padding-top: max(30px, 2vw); }
+@media (max-width: 650px) {
+  .desktop-frame .sidebar .brand { padding-right: 124px; }
+}

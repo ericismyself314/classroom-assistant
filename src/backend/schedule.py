@@ -3,11 +3,11 @@
 设计要点：
 - 不预先生成整个学期的空课堂记录；根据课表槽位 + 日期动态计算某天/某周有哪些课。
 - 用户上传录音、导入文字或修改某次课堂时，才在 class_sessions 中创建实际记录。
-- 周次以「包含学期开始日期的那一周」为第 1 周（周一为一周起点）。
+- 默认以学期开始日所在周为第 1 周。校准周次只调整周一基准，排课日期独立。
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Iterable
 
 from . import db
@@ -33,6 +33,40 @@ def week_number(semester_start: str, session_date: str) -> int:
     if not start or not sess:
         return 0
     return (monday_of(sess) - monday_of(start)).days // 7 + 1
+
+
+def week_anchor(semester: dict) -> str:
+    return semester.get("week_one_monday") or semester["start_date"]
+
+
+def calibrated_monday(reference: str, number: int) -> str:
+    day = _parse_date(reference)
+    if day is None or type(number) is not int or number < 1:
+        raise ValueError("请输入有效日期和大于零的整数周次。")
+    try:
+        return (monday_of(day) - timedelta(weeks=number - 1)).isoformat()
+    except OverflowError as exc:
+        raise ValueError("周次超出了可表示的日期范围。") from exc
+
+
+def session_with_week(session: dict, semester: dict | None) -> dict:
+    if not semester or (not semester.get("week_one_monday") and session.get("week_number")):
+        return session
+    number = week_number(week_anchor(semester), session["session_date"])
+    return {**session, "week_number": number if number > 0 else None}
+
+
+def validate_slots(slots: list[dict]) -> None:
+    if not isinstance(slots, list):
+        raise ValueError("课表格式无效。")
+    for i, slot in enumerate(slots, 1):
+        try:
+            weekday = int(slot["weekday"])
+            start, end = (time.fromisoformat(slot[key]) for key in ("start_time", "end_time"))
+            if not 0 <= weekday < 7 or end <= start:
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"请检查第 {i} 个时段的星期和起止时间。") from exc
 
 
 def _parse_date(s: str) -> date | None:
@@ -103,8 +137,8 @@ def build_week_plan(semester: dict, courses: list[dict], center: date) -> list[d
                     "start_time": slot["start_time"],
                     "end_time": slot["end_time"],
                     "location": slot.get("location") or course.get("location"),
-                    "session": sess,  # None 表示尚未创建
-                    "week_number": week_number(semester["start_date"], d.isoformat()),
+                    "session": session_with_week(sess, semester) if sess else None,
+                    "week_number": week_number(week_anchor(semester), d.isoformat()),
                 })
         day_slots.sort(key=lambda x: x["start_time"])
         plan.append({

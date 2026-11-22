@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import ipaddress
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -19,11 +22,11 @@ import sys
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 import zipfile
 from collections import deque
 
 from ..config import get_config
-from ..credential import get_credential
 from ..logutil import get_logger
 from .. import download as dl
 from . import manifest
@@ -158,11 +161,63 @@ class OllamaLLM(BaseLLM):
         return f"Ollama: {self.model}"
 
 
+class TranslationAPIError(RuntimeError):
+    """A safe-to-display API failure that repeating a segment cannot fix."""
+
+
+def normalize_api_endpoint(value: str) -> str:
+    message = "请填写 API 基础地址。外部服务须使用 HTTPS，地址中不能含密钥、账号或查询参数。"
+    if not isinstance(value, str):
+        raise ValueError(message)
+    raw = value.strip()
+    if (len(raw) > 2048 or not raw or any(ch.isspace() or ord(ch) < 32 for ch in raw)
+            or any(ch in raw for ch in ("\\", "?", "#"))):
+        raise ValueError(message)
+    try:
+        url = urlsplit(raw)
+        host = (url.hostname or "").encode("idna").decode("ascii").lower()
+        port = url.port
+        if (not host or "@" in url.netloc or "%" in url.netloc or url.scheme not in {"https", "http"}
+                or url.netloc.endswith(":")):
+            raise ValueError()
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if not address and not re.fullmatch(r"[a-z0-9.-]+", host):
+            raise ValueError()
+        if url.scheme == "http" and not (host == "localhost" or (address and address.is_loopback)):
+            raise ValueError()
+        path = url.path.rstrip("/")
+        if (not re.fullmatch(r"[A-Za-z0-9._~/:-]*", path)
+                or any(part in {".", ".."} for part in path.split("/"))):
+            raise ValueError()
+        path = path.removesuffix("/chat/completions")
+        authority = f"[{address.compressed}]" if address and address.version == 6 else host
+        if port is not None and port != (443 if url.scheme == "https" else 80):
+            authority += f":{port}"
+        return urlunsplit((url.scheme, authority, path, "", ""))
+    except (UnicodeError, ValueError):
+        raise ValueError(message) from None
+
+
+def normalize_api_model(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 256 or not value.strip().isprintable():
+        raise ValueError("请填写服务商提供的模型名称。")
+    return value.strip()
+
+
+def api_identity(base_url: str, model: str) -> str:
+    return hashlib.sha256(json.dumps([base_url, model], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 class OpenAICompatibleLLM(BaseLLM):
     def __init__(self, base_url: str, api_key: str, model: str):
-        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self.base_url = normalize_api_endpoint(base_url or "https://api.openai.com/v1")
         self.api_key = api_key
-        self.model = model or "gpt-4o-mini"
+        self.model = normalize_api_model(model or "gpt-4o-mini")
+        self.cache_identity = api_identity(self.base_url, self.model)
+        self.timeout = 120
         self.name = "openai"
 
     def available(self) -> bool:
@@ -182,14 +237,37 @@ class OpenAICompatibleLLM(BaseLLM):
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        r = httpx.post(
-            self.base_url + "/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=body,
-            timeout=900,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        try:
+            r = httpx.post(
+                self.base_url + "/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=body, follow_redirects=False,
+                timeout=httpx.Timeout(self.timeout, connect=min(8, self.timeout)),
+            )
+        except httpx.TimeoutException:
+            raise TranslationAPIError("API 连接超时，请检查服务地址和网络后重试。") from None
+        except (httpx.RequestError, UnicodeError, ValueError):
+            raise TranslationAPIError("无法连接 API，请检查服务地址、网络和证书。") from None
+        code = r.status_code
+        if not 200 <= code < 300:
+            messages = {
+                400: "请检查模型名称，以及它是否支持 JSON 格式的聊天回复。",
+                401: "密钥无效或已过期，请重新填写密钥。",
+                402: "账户额度不足，请检查余额。",
+                403: "密钥没有使用该模型的权限。",
+                404: "未找到接口或模型，请检查基础地址和模型名称。",
+                429: "请求过于频繁或额度已用完，请稍后重试或检查额度。",
+            }
+            detail = ("服务返回了重定向，请填写最终的 API 地址。" if 300 <= code < 400
+                      else messages.get(code, "请检查服务状态后重试。"))
+            raise TranslationAPIError(f"API 返回 HTTP {code}。{detail}")
+        try:
+            content = r.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip() or (self.api_key and self.api_key in content):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError, IndexError):
+            raise TranslationAPIError("API 没有返回有效的文字回复，请检查接口和模型。") from None
+        return content
 
     def model_label(self) -> str:
         return f"API: {self.model}"

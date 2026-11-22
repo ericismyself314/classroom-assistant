@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import re
+from datetime import date
+import math
 
 ALLOWED_CATEGORIES = {"exam", "assignment", "study_scope", "schedule_change", "activity", "other"}
 ALLOWED_CONFIDENCE = {"explicit", "probable", "uncertain"}
@@ -56,20 +58,12 @@ def _norm(s) -> str:
 
 
 def _quote_in_segment(quote: str, seg_text: str) -> bool:
-    """L2：引用是否在原文中。完全一致优先；否则做保守模糊匹配。"""
+    """L2：仅忽略标点/空白，引用的全部文字必须连续存在。"""
     q = _norm(quote)
     t = _norm(seg_text)
     if not q or not t:
         return False
-    if q in t:
-        return True
-    # 保守模糊：quote 较长时，要求首尾各一段都出现在原文（阈值保守）
-    if len(q) >= 8:
-        head = q[:5]
-        tail = q[-5:]
-        if head in t and tail in t:
-            return True
-    return False
+    return q in t
 
 
 def classify_context(text: str) -> str:
@@ -140,6 +134,10 @@ def _l1_structure(item: dict) -> str | None:
     nd = item.get("normalized_date")
     if nd:
         if not _DATE_RE.match(str(nd)):
+            return f"bad_date:{nd}"
+        try:
+            date.fromisoformat(str(nd))
+        except ValueError:
             return f"bad_date:{nd}"
     return None
 
@@ -227,6 +225,35 @@ def verify_item(item: dict, segments, by_idx, by_id, audio_duration: float | Non
     }
 
 
+def _source_position(item, segments, by_idx, by_id):
+    """Use located source text, never model-supplied timestamps, to order corrections."""
+    ordered = list(enumerate(segments))
+    times = [s.get('start_seconds') for s in segments]
+    if all(isinstance(t, (int, float)) and math.isfinite(t) for t in times):
+        ordered.sort(key=lambda pair: (pair[1]['start_seconds'], pair[0]))
+    ranks = {index: rank for rank, (index, _) in enumerate(ordered)}
+    positions = []
+    for evidence in item.get('evidence') or []:
+        quote = _norm(evidence.get('quote'))
+        cited = _resolve_segment(evidence, by_idx, by_id)
+        targets = [(i, s) for i, s in enumerate(segments)
+                   if s is cited and _quote_in_segment(quote, s.get('text', ''))]
+        if not targets:
+            targets = [(i, s) for i, s in enumerate(segments)
+                       if _quote_in_segment(quote, s.get('text', ''))]
+        matches = []
+        for index, segment in targets:
+            text = _norm(segment.get('text', ''))
+            position = text.find(quote)
+            while quote and position >= 0:
+                matches.append((ranks[index], position))
+                position = text.find(quote, position + 1)
+        if len(matches) != 1:
+            return None
+        positions.append(matches[0])
+    return max(positions) if positions else None
+
+
 def apply_verification(items: list[dict], segments: list[dict], session_meta: dict | None = None) -> dict:
     """对整批事项核查，并按状态分组。
 
@@ -240,37 +267,38 @@ def apply_verification(items: list[dict], segments: list[dict], session_meta: di
 
     verified = [verify_item(it, segments, by_idx, by_id, audio_duration) for it in items]
 
-    confirmed = [v for v in verified if v["verification_status"] == "confirmed"]
-    pending = [v for v in verified if v["verification_status"] == "pending"]
-    rejected = [v for v in verified if v["verification_status"] == "rejected"]
+    groups = {}
+    for value in verified:
+        if value['verification_status'] != 'rejected':
+            groups.setdefault((value.get('category'), _norm(value.get('title'))), []).append(value)
+    for group in groups.values():
+        if not any(v['context_type'] == 'correction_or_retraction' for v in group):
+            continue
+        positions = [_source_position(v, segments, by_idx, by_id) for v in group]
+        if None in positions:
+            for value in group:
+                value['verification_status'] = 'pending'
+            continue
+        latest = max(positions)
+        winners = [v for v, position in zip(group, positions) if position == latest]
+        facts = {(v.get('normalized_date') or '', _norm(v.get('details'))) for v in winners}
+        winner = winners[0]
+        wording = ' '.join(e.get('quote', '') for e in winner.get('evidence') or []).lower()
+        clear = winner['verification_status'] == 'confirmed' or (
+            winner['context_type'] == 'correction_or_retraction'
+            and winner.get('confidence') != 'uncertain'
+            and any(signal in wording for signal in CONFIRMED_SIGNALS))
+        if len(facts) != 1 or not clear:
+            for value in group:
+                value['verification_status'] = 'pending'
+            continue
+        for value in group:
+            value_facts = (value.get('normalized_date') or '', _norm(value.get('details')))
+            if value_facts != next(iter(facts)):
+                value.update(verification_status='rejected', rejection_reason='superseded_by_correction',
+                             context_type='correction_or_retraction')
+            elif value in winners and value['context_type'] == 'correction_or_retraction':
+                value['verification_status'] = 'confirmed'
 
-    # 前后修正覆盖：找到 correction 条目里带明确信号的，作为“最终”
-    # 明确信号可能出现在标题/详情，也可能出现在证据原文（如“已经确定改到…”），故合并判断
-    def _item_blob(v: dict) -> str:
-        parts = []
-        for ev in (v.get("evidence") or []):
-            parts.append(ev.get("quote", ""))
-        return " ".join(parts).lower()
-
-    finals = [v for v in verified
-              if v["context_type"] == "correction_or_retraction"
-              and v["verification_status"] != "rejected" and v.get("confidence") != "uncertain"
-              and any(sig in _item_blob(v) for sig in CONFIRMED_SIGNALS)]
-    if finals:
-        for f in finals:
-            f["verification_status"] = "confirmed"  # 以最后明确表述为准
-            # 把同分类、同标题但日期/地点不同的其它 confirmed/pending 标记为被覆盖
-            for v in verified:
-                if v is f or v["verification_status"] == "rejected":
-                    continue
-                if v.get("category") == f.get("category") and _norm(v.get("title")) == _norm(f.get("title")):
-                    if (v.get("normalized_date") or "") != (f.get("normalized_date") or "") or \
-                       _norm(v.get("details") or "") != _norm(f.get("details") or ""):
-                        v["verification_status"] = "rejected"
-                        v["rejection_reason"] = "superseded_by_correction"
-                        v["context_type"] = "correction_or_retraction"
-        confirmed = [v for v in verified if v["verification_status"] == "confirmed"]
-        pending = [v for v in verified if v["verification_status"] == "pending"]
-        rejected = [v for v in verified if v["verification_status"] == "rejected"]
-
-    return {"confirmed": confirmed, "pending": pending, "rejected": rejected}
+    return {status: [v for v in verified if v['verification_status'] == status]
+            for status in ('confirmed', 'pending', 'rejected')}

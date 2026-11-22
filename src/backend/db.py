@@ -25,7 +25,7 @@ LOG = get_logger("db")
 
 _local = threading.local()
 _WRITE_LOCK = threading.RLock()
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 9
 
 
 # ----------------------------------------------------------------------------
@@ -250,6 +250,26 @@ MIGRATIONS: list[tuple[int, str]] = [
         -- audio_manifest 保存完整的有序文件清单，兼容旧数据库和旧接口。
         ALTER TABLE class_sessions ADD COLUMN audio_manifest TEXT;
     """),
+    (7, """
+        ALTER TABLE semesters ADD COLUMN week_one_monday TEXT;
+    """),
+    (8, """
+        ALTER TABLE class_sessions ADD COLUMN audio_completed_at TEXT;
+        ALTER TABLE class_sessions ADD COLUMN audio_expired_at TEXT;
+        CREATE TABLE audio_archive_tasks (
+            session_id TEXT PRIMARY KEY REFERENCES class_sessions(id) ON DELETE CASCADE,
+            state TEXT NOT NULL DEFAULT 'pending', manual INTEGER NOT NULL DEFAULT 0, saved_bytes INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        );
+        CREATE TABLE audio_cleanup (
+            path TEXT PRIMARY KEY, size INTEGER NOT NULL, modified_ns INTEGER NOT NULL,
+            session_id TEXT, replacement TEXT
+        );
+    """),
+    (9, """
+        UPDATE important_items SET is_confirmed=1
+        WHERE verification_status != 'rejected' AND is_confirmed=0;
+    """),
 ]
 
 
@@ -424,7 +444,7 @@ def get_active_semester() -> dict | None:
 
 
 def update_semester(sid, **fields) -> None:
-    allowed = {"name", "start_date", "end_date", "timezone", "is_active"}
+    allowed = {"name", "start_date", "end_date", "timezone", "is_active", "week_one_monday"}
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
@@ -580,6 +600,7 @@ def audio_files_for_session(session_or_id) -> list[dict]:
                     "bytes": entry.get("bytes"),
                     "duration": entry.get("duration"),
                     "hash": entry.get("hash"),
+                    **{k: entry[k] for k in ("archived", "file_key") if k in entry},
                 })
             if files:
                 return files
@@ -603,10 +624,12 @@ def list_sessions(course_id: str, include_empty=True) -> list[dict]:
 
 
 def update_session(sid, **fields) -> None:
+    if fields.get("audio_path"):
+        fields["audio_expired_at"] = None
     allowed = {"session_date", "start_time", "end_time", "week_number", "title", "location",
                "status", "source_type", "audio_path", "audio_hash", "audio_duration_seconds",
                "audio_manifest", "transcript_language", "transcription_model", "analysis_model",
-               "processing_error", "notes_data"}
+               "processing_error", "notes_data", "audio_expired_at"}
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
@@ -643,12 +666,14 @@ def list_revisions(sid: str) -> list[dict]:
 
 def save_analysis(sid, topics, items, notes, model_label):
     import json
+    from . import audio_archive
     with write_txn():
         replace_topics(sid, topics)
         replace_items(sid, items)
         update_session(sid, analysis_model=model_label, notes_data=json.dumps(notes, ensure_ascii=False),
                        status="completed", processing_error=None)
         index_session(sid)
+        audio_archive.analysis_saved(sid)
 
 
 # ----------------------------------------------------------------------------
@@ -729,7 +754,7 @@ def replace_items(session_id, items: list[dict]) -> None:
                  _json_or_none(it.get("evidence_data") or it.get("evidence")),
                  it.get("verification_status", "pending"), it.get("context_type"),
                  it.get("rejection_reason"), int(bool(it.get("evidence_matched", True))),
-                 int(bool(it.get("is_confirmed", False))),
+                 int(it.get("verification_status") != "rejected"),
                  int(bool(it.get("is_completed", False))), now_iso(), now_iso()),
             )
 
@@ -783,9 +808,9 @@ def list_items(filters: dict | None = None) -> list[dict]:
         # 默认隐藏“已拒绝”的 AI 候选项（仍保留调试记录）
         conds.append("i.verification_status != 'rejected'")
     if f.get("handled") == "unhandled":
-        conds.append("(i.is_completed=0 AND i.is_confirmed=0)")
+        conds.append("i.is_completed=0")
     elif f.get("handled") == "handled":
-        conds.append("(i.is_completed=1 OR i.is_confirmed=1)")
+        conds.append("i.is_completed=1")
     if f.get("date_from"):
         conds.append("i.normalized_date>=?")
         params.append(f["date_from"])
@@ -808,7 +833,16 @@ def update_item(item_id, **fields) -> None:
     fields["updated_at"] = now_iso()
     cols = ", ".join(f"{k}=?" for k in fields)
     with write_txn() as c:
-        c.execute(f"UPDATE important_items SET {cols} WHERE id=?", tuple(fields.values()) + (item_id,))
+        if not c.execute(f"UPDATE important_items SET {cols} WHERE id=?", tuple(fields.values()) + (item_id,)).rowcount:
+            raise KeyError(item_id)
+        if 'title' in fields or 'details' in fields:
+            c.execute("DELETE FROM fts_search WHERE row_type='item' AND ref_id=?", (item_id,))
+            c.execute(
+                "INSERT INTO fts_search(content,row_type,ref_id,session_id,course_id,session_date,content_type) "
+                "SELECT COALESCE(i.title,'')||' '||COALESCE(i.details,''),'item',i.id,i.session_id,i.course_id,s.session_date,'important' "
+                "FROM important_items i JOIN class_sessions s ON s.id=i.session_id WHERE i.id=? AND i.verification_status!='rejected'",
+                (item_id,),
+            )
 
 
 def delete_item(item_id: str) -> None:

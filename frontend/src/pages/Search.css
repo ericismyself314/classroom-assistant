@@ -1,0 +1,45 @@
+.notes-search { max-width: 1080px; margin: 0 auto; color: #21372c; }
+.notes-search > header { margin-bottom: 20px; }
+.notes-search .ns-tools, .notes-search .ns-section { background: white; border: 1px solid #e0e8e1; border-radius: 20px; box-shadow: 0 4px 18px #243f2c06; }
+.notes-search .ns-tools { background: linear-gradient(125deg,#f0f6f1 0%,#fcfdfb 72%); padding: clamp(18px,2.4vw,28px); }
+.ns-tools form { display: flex; align-items: stretch; gap: 10px; }
+.ns-input { display: flex; align-items: center; min-width: 0; gap: 10px; flex: 1; padding: 0 14px; border: 1px solid #b9ccc0; border-radius: 13px; background: #fff; color: #4f735e; }
+.ns-input:focus-within { border-color: #508367; box-shadow: 0 0 0 3px #4777591c; }
+.ns-input input { flex: 1; min-width: 0; width: 100%; min-height: 49px; font-size: 16px; }
+.notes-search .ns-input input, .notes-search .ns-input input:focus { padding: 0; border: none; background: transparent; box-shadow: none; outline: none; }
+.ns-input button { border: 0; background: transparent; min-width: 28px; padding: 0; color: #617367; font-size: 20px; }
+.notes-search .ns-submit { padding: 0 24px; border-radius: 13px; font-size: 14px; }
+.ns-filters { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-top: 15px; }
+.ns-filters label { display: inline-flex; align-items: center; gap: 7px; color: #56685d; font-size: 12px; }
+.ns-filters select, .ns-filters input { width: auto; max-width: 210px; min-height: 32px; border: 1px solid #d4dfd7; border-radius: 9px; padding: 4px 8px; background-color: #fff; font-size: 13px; color: #304e3c; }
+.ns-filters .ns-reset { background: transparent; border: 0; color: #356648; }
+.ns-filters .app-select { min-inline-size: 7rem; min-height: 36px; padding-inline: 12px; border-radius: 12px; }
+.ns-filters .ns-course-select { inline-size: min(13rem, 55vw); --menu-width: 17rem; }
+.ns-tools [role="alert"] { font-size: 13px; color: #984c20; margin-bottom: 0; }
+.notes-search .ns-section { margin-top: 17px; padding: 19px clamp(16px,2vw,24px) 9px; }
+.ns-section h2 { margin: 0 0 12px; font-size: 17px; color: #253c2d; }
+.ns-heading { display: flex; align-items: baseline; gap: 12px; }
+.ns-heading small, .ns-recent small, .ns-meta time { color: #68736b; font-size: 12px; }
+.ns-kinds { display: flex; flex-wrap: wrap; gap: 4px; padding-bottom: 12px; }
+.ns-kinds button { min-height: 29px; padding: 4px 11px; color: #57655c; border: none; background: transparent; border-radius: 9px; }
+.ns-kinds button[aria-pressed="true"] { color: #23563b; background: #e4f0e7; font-weight: 600; }
+.notes-search :is(.ns-hit,.ns-recent) { display: flex; align-items: center; gap: 13px; justify-content: flex-start; width: 100%; padding: 15px 5px; border: 0; border-top: 1px solid #e9ede9; border-radius: 0; background: transparent; text-align: left; white-space: normal; }
+.notes-search :is(.ns-hit,.ns-recent):hover { background: #f4f8f4; border-color: #dce8df; }
+.ns-book { height: 36px; width: 36px; display: grid; place-items: center; border-radius: 11px; color: #406b50; background: #eaf2eb; flex: none; }
+.ns-recent strong, .ns-recent small { display: block; line-height: 1.6; }
+.ns-recent strong { font-size: 14px; }
+.ns-hit > svg, .ns-recent > svg { flex: none; margin-left: auto; color: #647b6b; }
+.ns-copy { min-width: 0; }
+.ns-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 12px; }
+.ns-meta > span { font-size: 11px; color: #365e47; background: #edf3ed; border-radius: 5px; padding: 2px 6px; }
+.ns-excerpt { display: block; margin-top: 7px; font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; color: #27382e; }
+.ns-excerpt mark { border-radius: 3px; background: #f7e6bb; color: #473e28; }
+.ns-message { margin: 12px 0 24px; color: #526158; }
+.session-notes [data-source-id]:focus { outline: 2px solid #92b59e; outline-offset: -2px; background-color: #edf5ef; border-radius: 10px; }
+@media (max-width: 650px) {
+  .notes-search .ns-tools { padding: 14px; }
+  .notes-search .ns-submit { padding: 0 12px; }
+  .ns-input { padding: 0 9px; gap: 6px; }
+  .ns-filters { gap: 8px; }
+  .ns-input input { font-size: 14px; }
+}

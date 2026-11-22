@@ -1,0 +1,56 @@
+.content:has(.ir-page) {
+  scrollbar-gutter: stable;
+}
+.ir-page { max-width:1120px; margin:auto; }
+.ir-tabs {
+  display:flex; width:fit-content; max-width:100%; flex-wrap:wrap; gap:3px; margin:18px 0 16px;
+  padding:4px; border-radius:16px; --selection-radius:12px;
+  background:#fff; border:1px solid var(--line);
+}
+.ir-tabs button { background:transparent; border:1px solid transparent; border-radius:12px; padding:7px 13px; color:#42574a; }
+.ir-tabs button[aria-pressed="true"] { background:var(--selection-fill); color:#17432d; }
+.ir-tabs button b { padding:1px 5px; border-radius:6px; background:#355d4410; font-variant-numeric:tabular-nums; }
+.ir-page .ir-panel { border-radius:20px; padding:18px clamp(16px,2.1vw,26px); }
+.ir-page .modal-mask:has(.ir-dialog) { background:#23392e38; backdrop-filter:blur(5px); }
+.ir-results-frame { overflow:clip; display:flow-root; }
+.ir-results { display:flow-root; }
+.ir-head,.ir-row-top,.ir-row-footer { display:flex; align-items:baseline; gap:12px; justify-content:space-between; }
+.ir-head { justify-content:flex-start; }.ir-head h2 { margin:0; font-size:19px; }
+.ir-head span,.ir-meta,.ir-row-footer>span,.ir-dialog small { color:#5e6b61; font-size:12px; }
+.ir-filters { margin:12px 0; color:#46604e; font-size:13px; }.ir-filters summary { width:fit-content; cursor:pointer; }
+.ir-filters>div { display:flex; flex-wrap:wrap; align-items:flex-end; gap:8px; margin:12px 0; }.ir-filters label,.ir-dialog label { display:grid; gap:4px; }
+.ir-filters :is(input,select) { width:auto; max-width:200px; }
+.ir-row { border-top:1px solid #e5ebe6; padding:15px 0; }.ir-row-top strong { font-size:16px; overflow-wrap:anywhere; }
+.ir-state { flex:none; padding:3px 8px; border-radius:7px; font-size:12px; background:#e7f0e9; color:#30583d; }
+.ir-meta { margin-top:3px; }.ir-row p,.ir-dialog p { margin:7px 0; line-height:1.6; overflow-wrap:anywhere; color:#34433a; }
+.ir-row-footer { align-items:center; flex-wrap:wrap; margin-top:7px; }.ir-row-footer>div { display:flex; flex-wrap:wrap; gap:7px; margin-left:auto; }
+.ir-row-footer button { min-height:30px; }.ir-row-footer .ir-action { color:#315843; background:#ecf4ed; border-color:#c7d9cc; }
+.ir-more { margin-top:8px; }.ir-empty { margin:22px 0; color:#5d695f; }
+.ir-dialog h4,.ir-dialog h5 { margin:10px 0; }.ir-dialog h4 { font-size:16px; }.ir-dialog h5 { font-size:14px; }
+.ir-dialog label { margin:15px 0 6px; }.ir-dialog :is(input,textarea,select) { width:100%; } .ir-dialog input[type=date] { width:fit-content; }
+.ir-quotes { max-height:min(26vh,200px); overflow:auto; background:#f2f6f2; border-radius:10px; padding:4px 12px; }
+.ir-quotes blockquote { margin:8px 0; line-height:1.6; font-size:13px; overflow-wrap:anywhere; }.ir-dialog [role=alert] { color:#8b3331; }
+@media (prefers-reduced-motion: no-preference) {
+  @supports selector(details::details-content) and (interpolate-size: allow-keywords) {
+    .ir-page .ir-filters { interpolate-size:allow-keywords; }
+    .ir-page .ir-filters::details-content {
+      block-size:0; overflow:clip;
+      transition:block-size 235ms cubic-bezier(.25,.1,.25,1),content-visibility 235ms allow-discrete;
+    }
+    .ir-page .ir-filters[open]::details-content { block-size:auto; }
+  }
+  .ir-page .ir-filters[open] > div { animation: ir-arrive 190ms ease-out; }
+  .ir-page .modal:has(.ir-dialog) { animation: ir-arrive 170ms ease-out; }
+}
+@keyframes ir-arrive { from { opacity:.36; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .ir-tabs.selection-group[data-selection-ready] > .selection-indicator { transition:none; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .ir-page .modal-mask:has(.ir-dialog) { backdrop-filter:none; }
+}
+@media (forced-colors: active) {
+  .content:has(.ir-page), .ir-tabs, .ir-page .ir-panel, .ir-page .modal { background:Canvas; backdrop-filter:none; }
+  .ir-page .modal-mask:has(.ir-dialog) { backdrop-filter:none; }
+}
+@media(max-width:650px) { .ir-tabs button {padding:5px 9px;}.ir-row-top {align-items:flex-start;} }

@@ -1,12 +1,10 @@
-# 课堂助手 3.0
+# 课堂助手 4.0.0
 
 课堂助手把课堂录音或已有文字稿整理成中文课堂概览、带时间戳的内容和重要事项。课程、录音、转写与模型默认保存在自己的 Windows 电脑上。
 
 ## 下载与首次使用
 
-从 [GitHub Releases](https://github.com/ericismyself314/classroom-assistant/releases/latest) 下载 `ClassroomAssistant-3.0.0-win-x64-portable.zip`，解压整个压缩包后运行 `ClassroomAssistant.exe`。请保留旁边的 `_internal` 文件夹。
-
-注意：仓库源码包含尚未打包发布的新版卡片界面；现有 3.0.0 下载包仍是此前的版本，源码更新不会自动更新下载包。
+从 [GitHub Releases](https://github.com/ericismyself314/classroom-assistant/releases/latest) 下载 `ClassroomAssistant-4.0.0-win-x64-portable.zip`，解压整个压缩包后运行 `ClassroomAssistant.exe`。请保留旁边的 `_internal` 文件夹。
 
 第一次使用需要联网并准备模型，预留约 2–5 GB 空间：
 
@@ -36,4 +34,4 @@
 
 ## 发布说明与许可
 
-3.0.1 的变化见 [`CHANGELOG.md`](CHANGELOG.md)。本项目采用 MIT License；第三方模型、运行库及依赖遵循各自许可证。
+4.0.0 的变化见 [`CHANGELOG.md`](CHANGELOG.md)。本项目采用 MIT License；第三方模型、运行库及依赖遵循各自许可证。

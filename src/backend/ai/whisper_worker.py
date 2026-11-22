@@ -93,6 +93,9 @@ class _QwenExternalWorker:
                 if progress_cb is not None and processed is not None:
                     try:
                         progress_cb(float(processed))
+                    except InterruptedError:
+                        self.close()
+                        raise
                     except Exception:  # noqa: BLE001
                         pass
                 # The timeout is an idle timeout, not a whole-recording cap.
@@ -102,11 +105,12 @@ class _QwenExternalWorker:
                 raise RuntimeError(str(result.get("error") or "Qwen 语音服务识别失败"))
             return result
 
-    def transcribe_file(self, audio_path: str, language: str | None, progress_cb=None) -> dict:
-        return self.request(
-            {"audio_path": audio_path, "language": language},
-            progress_cb=progress_cb,
-        )
+    def transcribe_file(self, audio_path: str, language: str | None, progress_cb=None,
+                        checkpoint_dir=None, checkpoint_namespace=None) -> dict:
+        payload = {"audio_path": audio_path, "language": language}
+        if checkpoint_dir:
+            payload.update(checkpoint_dir=os.fspath(checkpoint_dir), checkpoint_namespace=checkpoint_namespace)
+        return self.request(payload, progress_cb=progress_cb)
 
     def close(self) -> None:
         try:
@@ -433,6 +437,15 @@ def _get_qwen_model(device: str):
                 _qwen_external_worker = _start_qwen_external_worker("cpu")
         return _qwen_external_worker
 
+def release_model() -> None:
+    """Release ASR memory once all recordings in a job have been transcribed."""
+    global _qwen_external_worker
+    with _qwen_model_lock:
+        if _qwen_external_worker is not None:
+            _qwen_external_worker.close()
+            _qwen_external_worker = None
+
+
 def _load_audio_16k(audio_path: str):
     """Decode supported classroom audio without librosa/numba dependencies."""
     import av
@@ -513,7 +526,7 @@ def split_qwen_segment(text: str, start_seconds: float, end_seconds: float,
 
 
 def _transcribe_qwen(audio_path: str, language: str | None = None,
-                     device: str = "cpu", progress_cb=None):
+                     device: str = "cpu", progress_cb=None, checkpoint_dir=None, checkpoint_namespace=None):
     """Transcribe a local file with Qwen3-ASR using coarse timestamped chunks.
 
     Qwen3-ASR returns one text result per input, while the rest of the app
@@ -525,7 +538,8 @@ def _transcribe_qwen(audio_path: str, language: str | None = None,
 
     model = _get_qwen_model(device)
     if isinstance(model, _QwenExternalWorker):
-        payload = model.transcribe_file(audio_path, language, progress_cb=progress_cb)
+        payload = model.transcribe_file(audio_path, language, progress_cb=progress_cb,
+                                       checkpoint_dir=checkpoint_dir, checkpoint_namespace=checkpoint_namespace)
         out = []
         detected = None
         for item in payload.get("results", []):
@@ -551,33 +565,34 @@ def _transcribe_qwen(audio_path: str, language: str | None = None,
         LOG.info("Qwen 转写完成：%d 段，语言=%s，设备=%s", len(out), detected, model.device)
         return out, detected, model.device
 
-    SAMPLE_RATE = 16000
-
+    from .qwen_worker_service import transcribe_chunks, checkpoint_for, model_fingerprint
     wav = np.asarray(_load_audio_16k(audio_path), dtype=np.float32)
     if wav.size == 0:
         raise ValueError("录音文件为空")
-    duration = float(wav.shape[0]) / float(SAMPLE_RATE)
-    chunk_samples = int(120 * SAMPLE_RATE)
-    qwen_lang = _qwen_language(language)
+    checkpoint = None
+    if checkpoint_dir:
+        try:
+            identity = getattr(model, '_classroom_checkpoint_identity', None)
+            if identity is None:
+                identity = model_fingerprint(qwen_model_dir())
+                model._classroom_checkpoint_identity = identity
+            checkpoint = checkpoint_for(wav, checkpoint_dir, identity, _qwen_language(language), device, checkpoint_namespace)
+        except (OSError, ValueError, TypeError, BufferError, AttributeError):
+            pass
+    rows = transcribe_chunks(
+        model, wav, _qwen_language(language), device,
+        progress_cb=(lambda seconds, _total: progress_cb(seconds)) if progress_cb else None,
+        checkpoint=checkpoint,
+    )
     out = []
     detected = None
-    for start in range(0, wav.shape[0], chunk_samples):
-        end = min(wav.shape[0], start + chunk_samples)
-        chunk = wav[start:end]
-        if chunk.shape[0] < int(0.5 * SAMPLE_RATE):
-            chunk = np.pad(chunk, (0, int(0.5 * SAMPLE_RATE) - chunk.shape[0]))
-        result = model.transcribe(
-            audio=(chunk, SAMPLE_RATE),
-            language=qwen_lang,
-        )[0]
-        text = str(getattr(result, "text", "") or "").strip()
-        detected = _qwen_language_code(getattr(result, "language", None), language) or detected
-        if progress_cb:
-            progress_cb(float(end) / float(SAMPLE_RATE))
+    for row in rows:
+        text = row["text"]
+        detected = _qwen_language_code(row["language"], language) or detected
         if not text:
             continue
         for part in split_qwen_segment(
-            text, start / float(SAMPLE_RATE), end / float(SAMPLE_RATE),
+            text, row["start_seconds"], row["end_seconds"],
         ):
             out.append({**part, "original_text": part["text"],
                         "language": "mix" if language == "mix" else (detected or language),
@@ -621,7 +636,7 @@ def ensure_ready(device_pref: str = "auto") -> dict:
 
 def transcribe(audio_path: str, size: str = _QWEN_MODEL_ID, language: str | None = None,
                device_pref: str = "auto", progress_cb=None,
-               on_retry=None, vocabulary=""):
+               on_retry=None, vocabulary="", checkpoint_dir=None, checkpoint_namespace=None):
     """转写一段音频。
 
     新增 `device_pref` 与 `on_retry`：
@@ -643,9 +658,12 @@ def transcribe(audio_path: str, size: str = _QWEN_MODEL_ID, language: str | None
 
     qwen_validation = validate_qwen_model_installation()
     if qwen_validation["ok"]:
+        checkpoint_options = {"caller": checkpoint_namespace, "model_size": size,
+                              "language_mode": language, "vocabulary": str(vocabulary or "")}
         try:
             return _transcribe_qwen(
                 audio_path, language=language, device=device, progress_cb=progress_cb,
+                checkpoint_dir=checkpoint_dir, checkpoint_namespace=checkpoint_options,
             )
         except Exception as e:  # noqa: BLE001
             if device == "cuda" and _looks_like_qwen_gpu_error(e):
@@ -657,6 +675,7 @@ def transcribe(audio_path: str, size: str = _QWEN_MODEL_ID, language: str | None
                         pass
                 return _transcribe_qwen(
                     audio_path, language=language, device="cpu", progress_cb=progress_cb,
+                    checkpoint_dir=checkpoint_dir, checkpoint_namespace=checkpoint_options,
                 )
             raise
 

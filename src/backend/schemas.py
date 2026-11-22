@@ -149,16 +149,47 @@ def normalize_items(obj, session_date: str):
     return out, None
 
 
+def _date_from_wording(raw, base):
+    text = str(raw)
+    iso = re.fullmatch(r'\s*(\d{4}-\d{2}-\d{2})\s*', text)
+    if iso:
+        try:
+            return date.fromisoformat(iso.group(1)).isoformat()
+        except ValueError:
+            return None
+    year = re.search(r'(?<!\d)(\d{4})\s*年', text)
+    if year:
+        try:
+            base = date(int(year.group(1)), 1, 1)
+        except ValueError:
+            return None
+    elif '年' in text and '今年' not in text:
+        # The existing relative parser does not resolve other-year wording.
+        return None
+    return dateparse.parse_relative_date(text, base)
+
+
 def apply_date_normalization(items: list[dict], session_date: str) -> list[dict]:
-    """用相对日期解析补全 normalized_date（仅当模型未给出或给出不可信时）。"""
+    """校验真实日历日期；可解析原话与模型日期冲突时保留原话、等待确认。"""
     try:
         base = date.fromisoformat(session_date)
     except Exception:
         return items
     for it in items:
         raw = it.get("raw_date_text")
-        if raw and not it.get("normalized_date"):
-            nd = dateparse.parse_relative_date(raw, base)
-            if nd:
-                it["normalized_date"] = nd
+        model_date = it.get('normalized_date')
+        if model_date:
+            try:
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(model_date)):
+                    raise ValueError('invalid ISO date')
+                date.fromisoformat(str(model_date))
+            except ValueError:
+                it['normalized_date'] = model_date = None
+                it['confidence'] = 'uncertain'
+        parsed = _date_from_wording(raw, base) if raw else None
+        if parsed and model_date and parsed != model_date:
+            it['normalized_date'] = None
+            it['confidence'] = 'uncertain'
+        elif parsed and not model_date:
+            it['normalized_date'] = parsed
     return items

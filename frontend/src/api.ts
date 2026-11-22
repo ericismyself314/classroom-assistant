@@ -9,6 +9,8 @@ const UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const TIMEOUT_MARKER = '__CLASSROOM_ASSISTANT_TIMEOUT__';
 
 function requestLabel(path: string): string {
+  if (path.startsWith('/api/audio-storage')) return '录音空间管理';
+  if (path.includes('/settings/test-translation')) return '测试翻译服务';
   if (path.includes('/process')) return '重新分析';
   if (path.includes('/audio')) return '上传录音';
   if (path.includes('/transcript')) return '导入转写';
@@ -190,12 +192,25 @@ async function rawUploadWithProgress(
   });
 }
 
+export type AudioStorageStatus = {
+  text_only: boolean; eligible: number; pending: number; working: number; done: number;
+  unchanged: number; failed: number; saved_bytes: number; error: string | null;
+};
+
 export const api = {
+  audioStorage: (): Promise<AudioStorageStatus> => req('/api/audio-storage'),
+  setAudioRetention: (enabled: boolean): Promise<AudioStorageStatus> =>
+    req('/api/audio-storage', { method: 'PUT', body: JSON.stringify({ text_only: enabled }) }),
+  compressRecordings: (): Promise<AudioStorageStatus> =>
+    req('/api/audio-storage/compress', { method: 'POST', body: '{}' }),
   state: (brief = false) => req('/api/state' + (brief ? '?brief=1' : '')),
   readiness: () => req('/api/readiness'),
   semesters: () => req('/api/semesters'),
   createSemester: (b: any) => req('/api/semesters', { method: 'POST', body: JSON.stringify(b) }),
   activateSemester: (id: string) => req(`/api/semesters/${id}/activate`, { method: 'POST' }),
+  calibrateWeek: (id: string, date: string, number: number) => req(`/api/semesters/${id}/teaching-week`, {
+    method: 'PUT', body: JSON.stringify({ reference_date: date, week_number: number }),
+  }),
 
   courses: (sem?: string) => req('/api/courses' + (sem ? `?semester_id=${sem}` : '')),
   createCourse: (b: any) => req('/api/courses', { method: 'POST', body: JSON.stringify(b) }),
@@ -222,6 +237,7 @@ export const api = {
   process: (id: string, b: any) => req(`/api/sessions/${id}/process`, { method: 'POST', body: JSON.stringify(b) }),
 
   job: (id: string) => req(`/api/jobs/${id}`),
+  jobs: (): Promise<{ jobs: Job[] }> => req('/api/jobs'),
   cancelJob: (id: string) => req(`/api/jobs/${id}/cancel`, { method: 'POST' }),
 
   important: (q: Record<string, string>) => req('/api/important?' + new URLSearchParams(q)),
@@ -230,7 +246,9 @@ export const api = {
   settings: () => req('/api/settings'),
   saveSettings: (b: any) => req('/api/settings', { method: 'PUT', body: JSON.stringify(b) }),
   testWhisper: () => req('/api/settings/test-whisper', { method: 'POST' }),
-  testAnalysis: () => req('/api/settings/test-analysis', { method: 'POST' }),
+  testTranslation: (draft: { translation_base_url: string; translation_model: string; translation_api_key?: string }) =>
+    req('/api/settings/test-translation', { method: 'POST', body: JSON.stringify(draft) }),
+  testAnalysis: () => req('/api/settings/test-analysis', { method: 'POST', body: JSON.stringify({ local_model: true }) }),
   modelStatus: () => req('/api/models/status'),
   downloadWhisper: (size: string) => req('/api/models/whisper/download', { method: 'POST', body: JSON.stringify({ size }) }),
   validateWhisper: (sizes?: string[]) => req('/api/models/whisper/validate', { method: 'POST', body: JSON.stringify({ sizes: sizes || [] }) }),

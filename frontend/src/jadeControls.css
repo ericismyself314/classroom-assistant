@@ -1,0 +1,61 @@
+:root {
+  --jade-ink: #20523d;
+  --jade-tint: #e8f2ec;
+  --jade-edge: #c3d5c8;
+  --jade-control-radius: 12px;
+  --jade-gold: #bd965b;
+}
+.jade-player .player-controls {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 9px 14px 9px 10px; border: 1px solid #d4dfd7; border-radius: 19px;
+  background: linear-gradient(112deg,#f1f6f2,#fbfcfa 72%); box-shadow: inset 0 1px 0 #fff;
+}
+.jade-player .player-toggle {
+  display: grid; place-items: center; width: 39px; min-width: 39px; height: 39px; padding: 0;
+  color: #f6f9f4; background: linear-gradient(150deg,#426c54,#204934); border: 1px solid #355b46;
+  border-radius: 50%; box-shadow: inset 0 1px 0 #ffffff30;
+}
+.jade-player .player-toggle:hover { background: #36694f; color: white; }
+.jade-player input.player-progress {
+  appearance: none; cursor: pointer; min-width: 58px; flex: 1 1 100px; width: auto; padding: 0;
+  height: 6px; min-height: 6px; border: 0; border-radius: 6px; box-shadow: none;
+  background-color: #d5dfd7; background-image: linear-gradient(90deg,#619177,#316447);
+  background-repeat: no-repeat;
+}
+.jade-player .player-progress::-webkit-slider-thumb { appearance: none; width: 13px; height: 13px; border-radius: 50%; background: #bd965b; border: 2px solid white; box-shadow: 0 0 0 1px #927448; }
+.jade-player .player-progress::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: #bd965b; border: 2px solid white; }
+.jade-player .player-time { color: #364d40; font: 550 14px/1.25 Bahnschrift,"Segoe UI",sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.jade-player .player-rate { border-radius: 9px; color: var(--jade-ink); }
+.jade-player .player-volume input { accent-color: #49765b; }
+.jade-player.is-compact .player-controls { gap: 12px; }
+.session-notes .seg[data-playing], .session-notes .note-sources blockquote:has(> [aria-current="time"]),
+.session-notes .review-entry:has(> [aria-current="time"]), .session-notes .chapter-card:has(.chapter-body > .row > [aria-current="time"]),
+.session-notes .session-timeline-entry[aria-current="time"] { background: #f0f6f1; box-shadow: inset 3px 0 #437455; }
+.session-notes button[aria-current="time"] { background-color: #d6eadd; color: #19492f; }
+@media (prefers-reduced-motion: no-preference) {
+  .session-notes button[aria-current="time"] { animation: jade-seek .35s ease-out; }
+  .job-track i { transition: width .42s cubic-bezier(.22,.65,.32,1); }
+}
+@keyframes jade-seek { from { box-shadow: 0 0 0 4px #95bca588; } to { box-shadow: 0 0 0 0 transparent; } }
+.job-progress .job-overall-label { align-items: baseline; justify-content: flex-start; flex-wrap: wrap; margin: 10px 0 8px; }
+.job-overall-label b { font: 600 26px/1.1 Bahnschrift,"Segoe UI",sans-serif; color: var(--jade-ink); }
+.job-overall-label .job-eta { margin-left: auto; font-weight: 600; font-size: 14px; }
+.job-progress.is-compact .job-overall-label b { font-size: 21px; }
+.job-track { height: 5px; border-radius: 5px; background: #dbe5dd; overflow: hidden; }
+.job-track i { display: block; height: 100%; background: linear-gradient(90deg,#638b72,#356a4f); border-radius: inherit; position: relative; overflow:hidden; }
+.job-track i::after { content:""; position:absolute; inset:0 0 0 auto; width:5px; background:var(--jade-gold); border-radius:inherit; }
+.sidebar button.nav-item { border-radius: var(--jade-control-radius); min-height: 42px; }
+.sidebar .nav-item.active { color: var(--jade-ink); background: #ddebe1; box-shadow: inset 0 0 0 1px #c4d8cb; }
+.settings-page :is(button,select,.file-button), .modal:has(#course-name) :is(button,select,input:not([type="checkbox"])) { border-radius: var(--jade-control-radius); min-height: 38px; }
+.settings-page button.primary, .modal:has(#course-name) button.primary { background: var(--jade-ink); color: white; }
+.settings-page :is(input[type="checkbox"],input[type="radio"]), .modal:has(#course-name) input[type="checkbox"] { accent-color: #36694e; }
+.settings-page > .settings-section { border-radius: 18px; }
+.settings-page > .settings-section[open] > summary { color: var(--jade-ink); }
+.course-list .course-list-item[aria-pressed="true"] { background: var(--jade-tint); border-color: var(--jade-edge); }
+:where(.jade-player,.settings-page,.modal,.sidebar,.session-notes,.home-week) :is(button,select,input):focus-visible { outline: 2px solid #408164; outline-offset: 2px; }
+@media (max-width: 580px) {
+  .jade-player .player-controls { gap: 8px; padding: 8px; }
+  .jade-player .player-progress { flex-basis: 65px; }
+  .jade-player .player-time { font-size: 12px; }
+}
+

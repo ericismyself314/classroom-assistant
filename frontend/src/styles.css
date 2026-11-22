@@ -331,11 +331,7 @@ table.tbl th { color: var(--ink-2); font-weight: 600; }
 .chapter-body { min-width: 0; flex: 1; }
 .chapter-body h3 { font-size: 18px; margin: 1px 0 10px; }
 .chapter-summary { font-size: 15px; line-height: 1.8; margin: 0 0 8px; }
-.note-point { margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0ee; }
-.note-point p { margin: 6px 0; line-height: 1.8; white-space: pre-wrap; }
-.note-kind { font-size: 12px; font-weight: 600; color: var(--green); }
 .badge.important { background: #fff4d7; color: #996517; border-color: #efd8a6; }
-.important-point { border-left: 3px solid #e0ac3f; padding-left: 12px; }
 .note-sources { font-size: 12px; color: var(--ink-2); margin-top: 8px; }
 summary { cursor: pointer; }
 .note-sources blockquote { border-left: 2px solid var(--green-line); padding: 8px 12px; margin: 8px 0; background: #f8faf8; }

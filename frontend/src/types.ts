@@ -1,6 +1,10 @@
 export interface Semester {
   id: string; name: string; start_date: string; end_date: string;
   timezone: string; is_active: number;
+  week_one_monday?: string | null;
+}
+export interface TeachingWeek {
+  number: number; today: string; today_number: number; first: number; last: number;
 }
 export interface Course {
   id: string; semester_id: string; name: string; code: string | null;
@@ -17,11 +21,13 @@ export interface Session {
   location: string | null; status: string; source_type: string | null;
   audio_path: string | null; audio_hash: string | null; audio_duration_seconds: number | null;
   audio_manifest?: string | null;
+  audio_expired_at?: string | null;
   transcript_language: string | null; transcription_model: string | null;
   analysis_model: string | null; processing_error: string | null;
 }
 export interface AudioFile {
   index: number; name: string; bytes: number | null; duration: number | null;
+  hash?: string | null;
 }
 export interface Segment {
   id: string; session_id: string; sequence_number: number;
@@ -55,11 +61,23 @@ export interface Job {
   id: string; session_id: string; job_type: string; status: string;
   stage: string | null; progress_data: string | null; attempt_count: number;
   error_message: string | null;
+  created_at?: string | null; started_at?: string | null; finished_at?: string | null; updated_at?: string | null;
+  session_title?: string | null; course_name?: string | null;
+  progress?: {
+    phase?: string; stopped_phase?: string | null; phase_started_at?: string; observed_at?: string;
+    phase_durations?: Record<string, number>; completed?: number | null; total?: number | null;
+    unit?: 'audio_seconds' | 'segments' | 'operation' | null; overall_percent?: number;
+    rate_per_second?: number | null; sample_interval?: number | null;
+    eta_seconds?: number | null; phase_eta_seconds?: number | null;
+    eta_basis?: 'reference' | 'history' | 'live' | null;
+    checkpoint_epoch?: string; resumed?: boolean; translation_provider?: 'api' | 'local';
+  };
+  resume?: { mode: 'analyze' | 'transcribe'; label: string; checkpoint_epoch: string } | null;
 }
 export const CATEGORY_LABELS: Record<string, string> = {
   exam: '考试', assignment: '作业', study_scope: '学习范围',
   schedule_change: '安排变化', activity: '活动', other: '其它',
 };
 export const CONFIDENCE_LABELS: Record<string, string> = {
-  explicit: '明确通知', probable: '较明确', uncertain: '待确认',
+  explicit: '明确通知', probable: '较明确', uncertain: '表述不明确',
 };

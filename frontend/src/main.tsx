@@ -1,9 +1,11 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
+import { DesktopControls } from './components/DesktopControls';
 import './styles.css';
 import './glass.css';
 import './bento.css';
+import './jadeControls.css';
 
 type BoundaryState = { error: Error | null };
 
@@ -33,5 +35,5 @@ class AppErrorBoundary extends React.Component<React.PropsWithChildren, Boundary
 }
 
 createRoot(document.getElementById('root')!).render(
-  <AppErrorBoundary><App /></AppErrorBoundary>,
+  <><DesktopControls /><AppErrorBoundary><App /></AppErrorBoundary></>,
 );

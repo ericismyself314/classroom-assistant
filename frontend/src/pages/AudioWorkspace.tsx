@@ -1,14 +1,25 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api } from '../api';
-import { MicrophoneRecorder } from '../components/MicrophoneRecorder';
+import { MicrophoneRecorder, RecorderStart } from '../components/MicrophoneRecorder';
 import { RecognitionSettings, useRecognition } from '../components/RecognitionSettings';
 import { MAX_AUDIO_FILES, mergeAudioFiles, totalAudioBytes } from '../audioFiles';
 import { localDateISO } from '../localDate';
+import { recordingCourseNow } from '../schedule';
 import { Course, Session } from '../types';
 import { View } from '../App';
 import { TranscriptPreview } from '../components/TranscriptPreview';
+import { Icon } from '../components/Icon';
 
 const NEW_SESSION = '__new__';
+const styledPicker = globalThis.CSS?.supports('appearance: base-select') && CSS.supports('selector(::picker(select))');
+const sessionStates: Record<string, string> = { ready_to_process: '待处理', completed: '已完成', failed: '处理失败' };
+
+function courseLabel(course: Course): string {
+  const name = course.name.trim();
+  const code = course.code?.trim();
+  if (!name) return code || '未命名课程';
+  return code && code.toLowerCase() !== name.toLowerCase() ? `${name} · ${code}` : name;
+}
 
 function audioCount(session?: Session): number {
   if (!session) return 0;
@@ -21,9 +32,9 @@ function audioCount(session?: Session): number {
   return session.audio_path ? 1 : 0;
 }
 
-export function AudioWorkspace({ navigate, courseId: initialCourseId, sessionId: initialSessionId, date, title, source: initialSource }: {
+export function AudioWorkspace({ navigate, courseId: initialCourseId, sessionId: initialSessionId, date, title, source: initialSource, visible, onRecordingChange, onRecordingNotice, onRecordingSaved }: {
   navigate: (view: View) => void; courseId?: string; sessionId?: string; date?: string; title?: string;
-  source?: 'microphone' | 'upload';
+  source?: 'microphone' | 'upload'; visible: boolean; onRecordingChange: (active: boolean) => void; onRecordingNotice: (message: string) => void; onRecordingSaved: () => void;
 }) {
   const [courses, setCourses] = useState<Course[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -34,14 +45,25 @@ export function AudioWorkspace({ navigate, courseId: initialCourseId, sessionId:
   const [coursesLoading, setCoursesLoading] = useState(true);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [targetLocked, setTargetLocked] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [targetVersion, setTargetVersion] = useState(0);
+  const [source, setSource] = useState<'microphone' | 'upload'>(initialSource || 'microphone');
+  const [selectionHint, setSelectionHint] = useState('');
+  const pinned = useRef(false);
+  const picker = useRef<HTMLSelectElement>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
     let live = true;
-    api.courses().then(({ courses: result }) => {
+    api.courses().then(async ({ courses: result }: { courses: Course[] }) => {
+      if (initialCourseId && !result.some(item => item.id === initialCourseId)) {
+        try {
+          const prior = await api.getCourse(initialCourseId);
+          if (prior.course?.id === initialCourseId) result = [...result, prior.course];
+        } catch { if (live) setError('原课程暂时无法打开，请选择课程。'); }
+      }
       if (!live) return;
       setCourses(result);
-      if (!courseId) setCourseId(initialCourseId || result[0]?.id || '');
       setCoursesLoading(false);
     }).catch((e) => {
       if (live) { setError(e.message || '课程列表加载失败'); setCoursesLoading(false); }
@@ -50,84 +72,140 @@ export function AudioWorkspace({ navigate, courseId: initialCourseId, sessionId:
   }, []);
 
   useEffect(() => {
-    if (!courseId) { setSessions([]); return; }
+    if (initialCourseId || initialSessionId || pinned.current) return;
+    if (!visible) { setCourseId(''); return; }
+    let live = true;
+    const today = localDateISO();
+    api.week(today).then(plan => {
+      if (!live || pinned.current) return;
+      const now = new Date();
+      setCourseId(recordingCourseNow(plan.week || [], localDateISO(now), now.getHours() * 60 + now.getMinutes()));
+      setSessionDate(localDateISO(now));
+    }).catch(() => { if (live && !pinned.current) setCourseId(''); });
+    return () => { live = false; };
+  }, [visible, initialCourseId, initialSessionId]);
+
+  useEffect(() => {
+    if (!courseId) { setSessions([]); setSessionsLoading(false); return; }
     let live = true;
     setSessionsLoading(true);
     api.sessions(courseId).then(({ sessions: result }) => {
       if (!live) return;
       setSessions(result);
-      setSessionId((current) => initialSessionId && result.some((s: Session) => s.id === initialSessionId)
-        ? initialSessionId
-        : current !== NEW_SESSION && result.some((s: Session) => s.id === current) ? current : NEW_SESSION);
+      setSessionId(current => result.some((s: Session) => s.id === current) ? current : NEW_SESSION);
       setSessionsLoading(false);
     }).catch((e) => {
       if (live) { setError(e.message || '课堂列表加载失败'); setSessionsLoading(false); }
     });
     return () => { live = false; };
-  }, [courseId, initialSessionId]);
+  }, [courseId]);
 
   const course = courses.find((item) => item.id === courseId);
   const session = sessions.find((item) => item.id === sessionId);
+  const targetDate = session?.session_date || sessionDate;
+  const displayDate = targetDate ? new Date(targetDate + 'T12:00:00').toLocaleDateString('zh-CN', {
+    year: targetDate.slice(0, 4) === String(new Date().getFullYear()) ? undefined : 'numeric', month: 'long', day: 'numeric',
+  }) : '选择日期';
+  function manualTarget() {
+    pinned.current = true;
+    setTargetVersion(n => n + 1);
+    setError('');
+  }
+  function changeCourse(id: string) {
+    manualTarget(); setSelectionHint(''); setCourseId(id); setSessions([]); setSessionsLoading(!!id);
+    setSessionId(NEW_SESSION); setSessionTitle('');
+  }
+  function switchSource(value: 'microphone' | 'upload') {
+    pinned.current = true; setSource(value); setEditing(false);
+  }
+  function askForCourse(value: 'microphone' | 'upload') {
+    switchSource(value);
+    setSelectionHint(value === 'upload' ? '选好课程后即可导入录音。' : '选好课程后即可开始录音。');
+    picker.current?.focus();
+    try { picker.current?.showPicker?.(); } catch { /* The focused native select still works with the keyboard. */ }
+  }
+  const courseSelect = <select ref={picker} className="app-select audio-course-select" aria-label="课程" value={course?.id || ''}
+    disabled={coursesLoading || !courses.length || targetLocked} onFocus={() => { pinned.current = true; }}
+    onChange={e => changeCourse(e.target.value)}>
+    {!course && <option value="">{coursesLoading ? '正在读取课程…' : '选择课程'}</option>}
+    {courses.map(item => <option key={item.id} value={item.id} style={{ '--course-color': item.color } as CSSProperties}>{courseLabel(item)}</option>)}
+  </select>;
 
   return (
     <div className="audio-workspace">
       <div className="audio-workspace-header">
-        <div>
-          <h1 className="page-title">录音与转写</h1>
-        </div>
-        <button className="ghost" onClick={() => navigate({ name: 'week' })}>返回本周</button>
+        <h1 className="page-title">录音与转写</h1>
       </div>
-
-      <section className="card audio-target-card" aria-label="课程与课堂设置">
-        <div className="audio-section-title"><div><h2>课程与课堂</h2></div>
-          {session && <button className="ghost" onClick={() => navigate({ name: 'session', id: session.id })}>查看课堂记录</button>}
+      <div className="card capture-sheet" data-source={source}>
+      <section className="capture-target" aria-label="课程与课堂设置">
+        <div className="capture-coursebar">
+          <Icon name="book" width="18" height="18" />
+          {course ? <strong>{courseLabel(course)}</strong> : courseSelect}
+          <span className="capture-separator" aria-hidden="true">·</span><time dateTime={targetDate}>{displayDate}</time>
+          {session && <span className="capture-append">{session.title && session.title !== course?.name ? `${session.title} · ` : ''}{audioCount(session) ? `已有 ${audioCount(session)} 段录音` : '已有课堂'}</span>}
+          {course && !session && sessionTitle && sessionTitle !== course.name && <span className="capture-append">{sessionTitle}</span>}
+          {course && <button type="button" className="capture-link" aria-expanded={editing} aria-controls="capture-target-fields" disabled={targetLocked}
+            onClick={() => { pinned.current = true; setEditing(!editing); }}>{editing ? '收起' : '更改'}</button>}
         </div>
-        <div className="audio-target-grid">
-          <label>课程
-            <select value={courseId} disabled={coursesLoading || !courses.length || targetLocked} onChange={(e) => {
-              setCourseId(e.target.value); setSessionId(NEW_SESSION); setError('');
-            }}>
-              {!courses.length && <option value="">{coursesLoading ? '正在加载课程…' : '请先创建一门课程'}</option>}
-              {courses.map((item) => <option key={item.id} value={item.id}>{item.name}{item.code ? ` · ${item.code}` : ''}</option>)}
-            </select>
-          </label>
+        {editing && course && <div id="capture-target-fields" className="capture-target-fields"><div className="audio-target-grid">
+          <label>课程{courseSelect}</label>
           <label>课堂
-            <select value={sessionId} disabled={!courseId || sessionsLoading || targetLocked} onChange={(e) => setSessionId(e.target.value)}>
+            <select className="app-select audio-session-select" value={sessionId} disabled={sessionsLoading || targetLocked}
+              onChange={e => { manualTarget(); setSessionId(e.target.value); }}>
               <option value={NEW_SESSION}>新建一节课</option>
-              {sessions.map((item) => <option key={item.id} value={item.id}>{item.session_date} · {item.title || course?.name || '课堂'} · {item.status === 'ready_to_process' ? '待处理' : item.status === 'completed' ? '已完成' : item.status === 'failed' ? '处理失败' : '已有课堂'}</option>)}
+              {sessions.map((item) => {
+                const title = `${item.session_date} · ${item.title || course?.name || '课堂'}`;
+                const status = sessionStates[item.status] || '已有课堂';
+                const label = `${title} · ${status}`;
+                return <option key={item.id} value={item.id} aria-label={label} data-status={status}>{styledPicker ? title : label}</option>;
+              })}
             </select>
           </label>
           {sessionId === NEW_SESSION && <>
-            <label>上课日期<input type="date" value={sessionDate} onChange={(e) => setSessionDate(e.target.value)} /></label>
-            <label>课堂名称<input value={sessionTitle || course?.name || ''} onChange={(e) => setSessionTitle(e.target.value)} placeholder="例如：第 4 周 · 利率风险" /></label>
+            <label>上课日期<input type="date" required disabled={targetLocked} value={sessionDate} onChange={e => { manualTarget(); setSessionDate(e.target.value); }} /></label>
+            <label>课堂名称<input disabled={targetLocked} value={sessionTitle} onChange={e => { manualTarget(); setSessionTitle(e.target.value); }} placeholder={course.name} /></label>
           </>}
         </div>
-        {session && audioCount(session) > 0 && <div className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
-          本节课已保存 {audioCount(session)} 段录音；新添加的录音会按顺序追加。处理时将合并整节课的录音。
+        <div className="capture-existing">
+          {session && <><span>{audioCount(session) ? `本节已有 ${audioCount(session)} 段录音，新录音将按顺序追加。` : '新录音将保存到这节课堂。'}</span>
+            <button type="button" className="capture-link" onClick={() => navigate({ name: 'session', id: session.id })}>查看课堂记录</button></>}
+          <button type="button" className="capture-link" onClick={() => navigate({ name: 'recordings', courseId: course.id })}>查看这门课的录音</button>
+        </div>
         </div>}
+        {selectionHint && !course && <p role="status" className="small muted">{selectionHint}</p>}
       </section>
 
-      {courseId && course && <AudioWorkspaceEditor key={courseId} course={course} session={session} initialSource={initialSource}
+      {!course && courses.length > 0 && <section className="capture-stage" aria-label="录音来源">
+        {source === 'microphone' ? <RecorderStart visible={visible} onStart={() => askForCourse('microphone')} onImport={() => askForCourse('upload')} />
+          : <div className="capture-idle"><p className="capture-device"><Icon name="upload" />导入已有录音</p><div className="capture-actions">
+            <button type="button" className="primary" onClick={() => askForCourse('upload')}>选择课程并导入</button>
+            <button type="button" className="capture-link" onClick={() => { switchSource('microphone'); setSelectionHint(''); }}>返回麦克风录音</button></div></div>}
+      </section>}
+      {course && (sessionId === NEW_SESSION || session) && <AudioWorkspaceEditor course={course} session={session} source={source} onSourceChange={switchSource}
+        targetVersion={targetVersion} visible={visible} onUseTarget={() => { pinned.current = true; setEditing(false); }}
         sessionDate={sessionDate} sessionTitle={sessionTitle || course.name} navigate={navigate}
+        onRecordingChange={onRecordingChange} onRecordingNotice={onRecordingNotice} onRecordingSaved={onRecordingSaved}
         onTargetLock={setTargetLocked}
         onSessionSaved={(saved) => {
           setSessions((current) => [saved, ...current.filter((item) => item.id !== saved.id)]);
           setSessionId(saved.id);
         }} />}
       {coursesLoading && <div className="empty">正在加载课程…</div>}
-      {!coursesLoading && !courses.length && <div className="empty">请先在“课程”页面创建课程，再开始录音或上传。</div>}
+      {!coursesLoading && !courses.length && !error && <div className="empty">添加课程后即可开始录音。 <button onClick={() => navigate({ name: 'courses' })}>我的课程</button></div>}
       {error && <p className="quality-warning" role="alert">{error}</p>}
+      </div>
     </div>
   );
 }
 
-function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, initialSource, navigate, onSessionSaved, onTargetLock }: {
-  course: Course; session?: Session; sessionDate: string; sessionTitle: string; initialSource?: 'microphone' | 'upload';
+function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, source, onSourceChange, targetVersion, visible, onUseTarget, navigate, onSessionSaved, onTargetLock, onRecordingChange, onRecordingNotice, onRecordingSaved }: {
+  course: Course; session?: Session; sessionDate: string; sessionTitle: string; source: 'microphone' | 'upload';
+  onSourceChange: (source: 'microphone' | 'upload') => void; targetVersion: number; visible: boolean; onUseTarget: () => void;
   navigate: (view: View) => void; onSessionSaved: (session: Session) => void;
-  onTargetLock: (locked: boolean) => void;
+  onTargetLock: (locked: boolean) => void; onRecordingChange: (active: boolean) => void; onRecordingNotice: (message: string) => void;
+  onRecordingSaved: () => void;
 }) {
   const recognition = useRecognition(course.id);
-  const [source, setSource] = useState<'upload' | 'microphone'>(initialSource || 'microphone');
   const [plan, setPlan] = useState<'now' | 'later'>('now');
   const [files, setFiles] = useState<File[]>([]);
   const filesRef = useRef<File[]>([]);
@@ -145,9 +223,11 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
   useEffect(() => {
     setStoredAudioCount(audioCount(session));
     if (!session) setCreatedSessionId('');
-  }, [session?.id, session?.audio_manifest, session?.audio_path]);
+  }, [course.id, targetVersion, session?.id, session?.audio_manifest, session?.audio_path]);
 
   const addFiles = (incoming: File[]) => {
+    if (busy) return;
+    onUseTarget();
     const current = filesRef.current;
     const result = mergeAudioFiles(current, incoming);
     filesRef.current = result.files;
@@ -168,21 +248,14 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
     setProgress({ loaded: 0, total: totalAudioBytes(next) });
     setError(''); setMessage('');
   };
-  const removeQueuedFile = (file: File) => {
-    const index = filesRef.current.findIndex((item) => item === file || (
-      item.name === file.name && item.size === file.size && item.lastModified === file.lastModified
-    ));
-    if (index < 0) return false;
-    removeFile(index);
-    return true;
-  };
 
-  const beginAnalysis = async () => {
-    if (!session || busy || recordingActive || files.length) return;
+  const beginAnalysis = async (id: string) => {
+    if (busy || recordingActive || (source === 'upload' && files.length)) return;
     setBusy(true); setError('');
     try {
-      await api.process(session.id, { mode: 'transcribe' });
-      navigate({ name: 'session', id: session.id });
+      if (recognition.ready) await recognition.save();
+      await api.process(id, { mode: 'transcribe' });
+      navigate({ name: 'session', id });
     } catch (e: any) {
       setError(e.message || '无法开始处理');
     } finally { setBusy(false); }
@@ -190,6 +263,7 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
 
   const upload = async () => {
     if (recordingActive || busy) return;
+    if (!session && !sessionDate) { setError('请选择上课日期。'); return; }
     if (!files.length) { setError('请先添加至少一段录音。'); return; }
     if (plan === 'now' && !recognition.ready) { setError(recognition.error || '语音识别设置还在加载，请稍后重试。'); return; }
     setBusy(true); setError(''); setMessage('');
@@ -227,6 +301,9 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
         setStoredAudioCount(existingCount + uploadedCount);
         setProgress({ loaded: uploadedBytes, total: totalBytes });
       }
+      filesRef.current = []; setFiles([]);
+      setCreatedSessionId(sessionForUpload.id);
+      setBusy(false); onRecordingSaved();
       navigate({ name: 'session', id: sessionForUpload.id });
     } catch (e: any) {
       if (sessionForUpload) {
@@ -239,7 +316,7 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
           setFiles(remaining);
           setStoredAudioCount((latest.audio_files || []).length);
           onSessionSaved(latest.session as Session);
-          if (newRemoteFiles.length) setMessage(`已确认 ${newRemoteFiles.length} 段录音保存成功；可重试剩余录音。`);
+          if (newRemoteFiles.length) { onRecordingSaved(); setMessage(`已确认 ${newRemoteFiles.length} 段录音保存成功，可重试剩余录音。`); }
         } catch { /* keep the local queue if the status check itself fails */ }
       }
       setError(uploadedCount
@@ -254,54 +331,49 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
 
   return (
     <>
-      {session?.status === 'ready_to_process' && hasStoredAudio && <section className="card audio-staged-banner">
-        <div><b>已有录音已保存，尚未开始处理</b><p className="small muted">{files.length ? '先上传或移除清单中的新录音，再处理本节课。' : '可以先检查课堂详情，也可以现在开始语音识别和中文整理。'}</p></div>
-        <button className="primary" disabled={busy || recordingActive || files.length > 0} onClick={beginAnalysis}>{busy ? '正在启动…' : '开始转写并整理'}</button>
+      {source === 'upload' && session?.status === 'ready_to_process' && hasStoredAudio && <section className="card audio-staged-banner">
+        <div><b>本节课已有录音记录，等待处理</b><p className="small muted">{files.length ? '先上传或移除队列中的新录音，再处理本节课。' : '可在「我的录音」回听，也可以启动转写和整理。'}</p></div>
+        <button className="primary" disabled={busy || recordingActive || files.length > 0} onClick={() => void beginAnalysis(session.id)}>{busy ? '正在启动…' : '开始转写并整理'}</button>
       </section>}
 
-      <div className="audio-workspace-grid">
-        <section className="card audio-source-card">
-          <div className="audio-section-title">
-            <div><h2>录音来源</h2></div>
-            <span className="small muted">支持最多 {MAX_AUDIO_FILES} 段，按列表顺序处理</span>
-          </div>
-          <div className="audio-source-tabs" role="tablist" aria-label="录音来源">
-            <button className={source === 'upload' ? 'active' : ''} role="tab" aria-selected={source === 'upload'}
-              disabled={recordingActive || busy} onClick={() => setSource('upload')}>上传已有录音</button>
-            <button className={source === 'microphone' ? 'active' : ''} role="tab" aria-selected={source === 'microphone'}
-              disabled={recordingActive || busy} onClick={() => setSource('microphone')}>电脑麦克风录音</button>
-          </div>
-
-          {source === 'upload' ? <div className="audio-dropzone" onDragOver={(e) => e.preventDefault()}
+      <div className={source === 'upload' && files.length > 0 ? 'capture-upload-layout' : 'capture-mic-layout'}>
+        <section className="capture-source">
+          {source === 'upload' && <><div className="capture-upload-heading"><h2>导入已有录音</h2>
+            <button type="button" className="capture-link" disabled={busy} onClick={() => onSourceChange('microphone')}><Icon name="mic" />麦克风录音</button></div>
+          <div className="audio-dropzone" onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => { e.preventDefault(); addFiles(Array.from(e.dataTransfer.files || [])); }}>
-            <div className="audio-drop-icon">↑</div>
+            <div className="capture-upload-icon"><Icon name="upload" /></div>
             <b>把录音拖到这里，或从电脑选择</b>
             <p className="small muted">MP3、M4A、WAV、AAC、FLAC、OGG、WebM、MP4 · 单个文件不超过 2GB</p>
             <label className="btn ghost audio-file-picker">{files.length ? '继续添加录音' : '选择录音文件'}
               <input type="file" multiple hidden accept=".mp3,.m4a,.wav,.aac,.flac,.ogg,.webm,.mp4,.mov" disabled={busy}
                 onChange={(e) => { addFiles(Array.from(e.target.files || [])); e.currentTarget.value = ''; }} />
             </label>
-          </div> : <div className="audio-microphone-panel">
-            <MicrophoneRecorder title={sessionTitle || course.name} onAddFile={(file) => addFiles([file])} onRemoveFile={removeQueuedFile} onRecordingChange={setRecordingActive} disabled={busy} />
-          </div>}
+          </div></>}
+          <div hidden={source !== 'microphone'}>
+            <MicrophoneRecorder key={`${course.id}-${targetVersion}`} visible={visible && source === 'microphone'} courseId={course.id} courseName={courseLabel(course)}
+              sessionId={session?.id} sessionDate={session?.session_date || sessionDate} title={session?.title || sessionTitle || course.name}
+              onRecordingChange={active => { if (active) onUseTarget(); setRecordingActive(active); onRecordingChange(active); }}
+              onRecordingNotice={onRecordingNotice} onConfirmed={onRecordingSaved} onImport={() => onSourceChange('upload')} onProcess={beginAnalysis}
+              onView={saved => navigate({ name: 'recordings', sessionId: saved.session_id, fileIndex: saved.file.index, fileKey: saved.file.file_key })}
+              onSaved={async id => { const detail = await api.sessionDetail(id); onSessionSaved(detail.session as Session); }} disabled={busy || (!session && !sessionDate)} />
+          </div>
+          {(source === 'microphone' || !files.length) && error && <p className="quality-warning" role="alert">{error}</p>}
+          {source === 'upload' && !files.length && message && <p className="hint">{message}</p>}
 
           <details className="audio-recognition-panel">
             <summary>语音识别设置</summary>
-            <div><b>语音识别设置</b><span className="small muted">修改后保存为本课程设置，稍后处理也会使用</span></div>
-            <RecognitionSettings value={recognition.value} onChange={recognition.setValue} disabled={busy || !recognition.ready} />
+            <p className="small muted">设置将用于本课程的语音识别。</p>
+            <RecognitionSettings value={recognition.value} onChange={value => { onUseTarget(); recognition.setValue(value); }} disabled={busy || !recognition.ready} />
             {recognition.error && <p className="quality-warning" role="alert">{recognition.error}</p>}
           </details>
         </section>
 
-        <aside className="card audio-queue-card">
+        {source === 'upload' && files.length > 0 && <aside className="audio-queue-card capture-queue" aria-label="导入队列">
           <div className="audio-section-title">
-            <div><h2>本次录音</h2></div>
-            <span className={`badge ${files.length ? 'green' : 'gray'}`}>{files.length} 段</span>
+            <div><h2>导入顺序</h2></div>
+            <span className="small muted">{files.length} 段</span>
           </div>
-          {files.length === 0 ? <div className="audio-queue-empty">
-            <div className="audio-empty-icon">♫</div><b>还没有添加录音</b>
-            <span className="small muted">选择音频文件，或切换到电脑麦克风录音。停止录制后会自动加入这里。</span>
-          </div> : <>
             <div className="audio-queue-summary">合计 {(totalAudioBytes(files) / 1024 / 1024).toFixed(1)} MB <span>·</span> 顺序就是处理顺序</div>
             <div className="audio-queue-list">
               {files.map((file, index) => <div className="audio-queue-item" key={`${file.name}-${file.lastModified}-${index}`}>
@@ -310,8 +382,6 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
                 <button className="ghost danger audio-remove" disabled={busy || recordingActive} aria-label={`移除 ${file.name}`} onClick={() => removeFile(index)}>移除</button>
               </div>)}
             </div>
-          </>}
-
           {session && audioCount(session) > 0 && <div className="audio-existing-note">本节已有 {audioCount(session)} 段录音，新录音会追加，不会覆盖旧文件。</div>}
           <div className="audio-processing-options">
             <div className="audio-section-title"><div><h3>处理方式</h3></div></div>
@@ -338,14 +408,15 @@ function AudioWorkspaceEditor({ course, session, sessionDate, sessionTitle, init
           <button className="primary audio-submit" disabled={busy || recordingActive || !files.length || (plan === 'now' && !recognition.ready)} onClick={upload}>
             {busy ? '正在上传…' : plan === 'now' ? '上传并开始处理' : '仅上传，稍后处理'}
           </button>
-          <p className="small muted audio-privacy-note">录音保存在你的电脑上。处理完成后，可在课堂详情删除录音并保留文字。</p>
-          {session?.status === 'completed' && session.source_type === 'audio' && <button className="ghost audio-reanalyze" disabled={busy || files.length > 0}
+        </aside>}
+      </div>
+      {source === 'upload' && session && <div className="capture-existing-tools">
+          {session.status === 'completed' && session.source_type === 'audio' && <button className="ghost audio-reanalyze" disabled={busy || files.length > 0}
             onClick={async () => { try { setBusy(true); await api.process(session.id, { mode: 'analyze' }); navigate({ name: 'session', id: session.id }); } catch (e: any) { setError(e.message || '重新分析失败'); setBusy(false); } }}>
             仅重新分析现有转写
           </button>}
-          <details className="queue-preview"><summary>查看已有转写与笔记</summary><TranscriptPreview sessionId={session?.id} /></details>
-        </aside>
-      </div>
+          <details className="queue-preview"><summary>查看已有转写与笔记</summary><TranscriptPreview sessionId={session.id} /></details>
+      </div>}
     </>
   );
 }

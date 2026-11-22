@@ -15,12 +15,14 @@ import shutil
 import subprocess
 import threading
 import traceback
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-from . import backup, config, dateparse, db, diagnostics, hashutil, jobs, paths, schedule, note_editing
-from .ai import llm_provider, manifest, whisper_worker
+from . import audio_archive, backup, config, dateparse, db, diagnostics, hashutil, jobs, paths, schedule, note_editing, recording_drafts
+from .ai import llm_provider, manifest, translation_provider, whisper_worker
 from .selftest import compute_readiness_state
-from .ai.provider import build_provider, detect_status, provider_is_ready
+from .ai.provider import build_provider, detect_status, legacy_api_connection, provider_is_ready
 from .logutil import get_logger
 from .pipeline import run_pipeline, _resolve_whisper_size
 
@@ -64,19 +66,58 @@ def _run_pipeline_thread(session_id, mode, whisper_tier, language, job_id):
 
 
 def start_pipeline(session_id, mode, whisper_tier=None, language=None):
+    mode = str(mode).lower()
+    if mode == 'full':
+        mode = 'transcribe'
+    if mode not in {'transcribe', 'retranscribe', 'analyze', 'reanalyze', 'resume'}:
+        return None, '不支持的处理方式'
+    if mode == 'resume' and language is not None:
+        return None, '继续任务会沿用原识别设置；修改语言后请选择重新转写'
     with db.write_txn():
         if db.active_jobs():
             return None, "已有任务在进行中，请等待其完成或取消后再试"
-        if not db.get_session(session_id):
+        session = db.get_session(session_id)
+        if not session:
             return None, '课堂记录不存在'
+        resume = None
+        if mode == 'resume':
+            resume = jobs.resume_details(session, _latest_job(session_id))
+            if not resume:
+                return None, '没有可继续的未完成任务，请选择重新分析或重新转写'
+            mode = resume['mode']
+            language = resume['language']
         job_type = "transcribe" if mode in ("transcribe", "retranscribe") else "analyze"
         job_id = db.create_job(session_id, job_type, status="pending", stage="排队中")
+        previous = jobs.progress(_latest_job(session_id, exclude=job_id)) if resume else {}
+        initial = {k: previous[k] for k in ('transcript_complete', 'transcript_signature') if k in previous}
+        initial['checkpoint_epoch'] = resume['checkpoint_epoch'] if resume else job_id
+        course = db.get_course(session['course_id']) or {}
+        initial.update(effective_language=language or course.get('language_mode', 'auto'),
+                       course_language_mode=course.get('language_mode'))
+        db.update_job(job_id, progress_data=json.dumps(initial, ensure_ascii=False))
         db.update_session(session_id, status="file_check" if job_type == "transcribe" else "analyzing",
                           processing_error=None)
         jobs.clear_cancel(session_id)
     t = threading.Thread(target=_run_pipeline_thread, args=(session_id, mode, whisper_tier, language, job_id), daemon=True)
     t.start()
     return job_id, None
+
+
+def _latest_job(session_id, exclude=''):
+    row = db.read_conn().execute(
+        'SELECT * FROM processing_jobs WHERE session_id=? AND id!=? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+        (session_id, exclude),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _public_job(job):
+    if not job:
+        return None
+    value = dict(job)
+    value['progress'] = jobs.progress(value)
+    value['resume'] = jobs.resume_details(db.get_session(value['session_id']), value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +287,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # response is still streaming. This is a client-side disconnect,
             # not an application failure; do not turn it into a misleading 500.
             LOG.info("客户端中断请求: %s (%s)", self.path, e)
+        except recording_drafts.DraftError as e:
+            _send_json(self, {"error": str(e)}, status=e.status)
         except Exception as e:  # noqa: BLE001
             LOG.exception("请求处理异常: %s", self.path)
             try:
@@ -267,6 +310,75 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     # ---------------- API ----------------
     def _handle_api(self, p, method):
+        if p == '/api/recordings' and method == 'GET':
+            from .recording_library import library
+            return _send_json(self, library())
+        match = re.fullmatch(r'/api/recordings/([\w-]+)/files/(\d+)', p)
+        if match and method == 'DELETE':
+            key = self._qs_dict().get('key')
+            if not key:
+                return _send_json(self, {'error': '请选择要删除的那段录音。'}, status=400)
+            return self._delete_staged_audio_file(match.group(1), int(match.group(2)), key)
+        if match and method == 'GET':
+            from .recording_library import resolve_file
+            path = resolve_file(match.group(1), int(match.group(2)), self._qs_dict().get('key'))
+            return self._serve_file(path)
+        audio_location = re.fullmatch(r'/api/sessions/([\w-]+)/audio/(\d+)/reveal', p)
+        draft_location = re.fullmatch(r'/api/recording-drafts/([a-f0-9]{32})/reveal', p)
+        if method == 'POST' and (audio_location or draft_location):
+            from .recording_library import reveal, show_in_folder
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+            except ValueError:
+                return _send_json(self, {'error': '请求长度无效。'}, status=400)
+            if not 0 <= length <= 4096:
+                return _send_json(self, {'error': '文件定位请求过大。'}, status=413)
+            # Consume the small request body before replying. Windows can reset an unread POST on close.
+            payload = self.rfile.read(length)
+            origin = self.headers.get('Origin')
+            if origin and origin != 'http://' + self.headers.get('Host', ''):
+                return _send_json(self, {'error': '请在课堂助手内打开录音位置。'}, status=403)
+            if self.headers.get_content_type() != 'application/json':
+                return _send_json(self, {'error': '请从课堂录音清单选择文件。'}, status=400)
+            try:
+                body = json.loads(payload or b'{}')
+            except (ValueError, UnicodeDecodeError):
+                return _send_json(self, {'error': '请从课堂录音清单选择文件。'}, status=400)
+            if audio_location:
+                return _send_json(self, reveal(audio_location.group(1), int(audio_location.group(2)), body))
+            if body != {}:
+                raise recording_drafts.DraftError('请从录音草稿清单选择文件。')
+            return _send_json(self, show_in_folder(recording_drafts.fragment_location(draft_location.group(1))))
+        # Microphone fragments are persisted separately from the browser's transient state.
+        if p == '/api/recording-drafts' or p.startswith('/api/recording-drafts/'):
+            from . import recording_drafts as drafts
+            try:
+                if p == '/api/recording-drafts' and method == 'GET':
+                    return _send_json(self, drafts.list_drafts())
+                if p == '/api/recording-drafts' and method == 'POST':
+                    return _send_json(self, drafts.create(_read_json(self)))
+                match = re.fullmatch(r'/api/recording-drafts/([a-f0-9]{32})/chunks/(\d+)', p)
+                if match and method == 'PUT':
+                    try:
+                        length = int(self.headers.get('Content-Length', '0'))
+                    except ValueError:
+                        raise drafts.DraftError('录音分片长度无效')
+                    if length <= 0 or length > drafts._MAX_CHUNK:
+                        raise drafts.DraftError('录音分片为空或超过大小上限')
+                    data = self.rfile.read(length)
+                    if len(data) != length:
+                        raise drafts.DraftError('录音分片传输中断', 400)
+                    return _send_json(self, drafts.put_chunk(match.group(1), int(match.group(2)), data))
+                match = re.fullmatch(r'/api/recording-drafts/([a-f0-9]{32})/(heartbeat|finalize)', p)
+                if match and method == 'POST':
+                    if match.group(2) == 'heartbeat':
+                        return _send_json(self, drafts.heartbeat(match.group(1)))
+                    body = _read_json(self)
+                    return _send_json(self, drafts.finalize(match.group(1), bool(body.get('interrupted')),
+                                                            bool(body.get('capture_interrupted'))))
+            except drafts.DraftError as e:
+                return _send_json(self, {'error': str(e)}, status=e.status)
+
         # 健康检查
         if p == "/api/health":
             return _send_json(self, {"ok": True})
@@ -295,6 +407,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             db.set_active_semester(m.group(1))
             return _send_json(self, {"ok": True})
+        m = re.fullmatch(r"/api/semesters/([\w-]+)/teaching-week", p)
+        if m and method == "PUT":
+            b = _read_json(self)
+            if not db.get_semester(m.group(1)):
+                return _send_json(self, {"error": "学期不存在。"}, status=404)
+            try:
+                anchor = schedule.calibrated_monday(b.get("reference_date"), b.get("week_number"))
+            except ValueError as exc:
+                return _send_json(self, {"error": str(exc)}, status=400)
+            db.update_semester(m.group(1), week_one_monday=anchor)
+            return _send_json(self, {"week_one_monday": anchor})
 
         # 课程
         if p == "/api/courses" and method == "GET":
@@ -302,11 +425,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             return _send_json(self, {"courses": db.list_courses(semester_id=sem[0] if sem else None)})
         if p == "/api/courses" and method == "POST":
             b = _read_json(self)
-            cid = db.create_course(b["semester_id"], b["name"], b.get("code"),
-                                   b.get("teacher_name"), b.get("location"),
-                                   b.get("language_mode", "auto"), b.get("color", "#4CAF50"))
-            if b.get("slots"):
-                db.replace_slots(cid, b["slots"])
+            try:
+                schedule.validate_slots(b.get("slots", []))
+            except ValueError as exc:
+                return _send_json(self, {"error": str(exc)}, status=400)
+            with db.write_txn():
+                cid = db.create_course(b["semester_id"], b["name"], b.get("code"),
+                                       b.get("teacher_name"), b.get("location"),
+                                       b.get("language_mode", "auto"), b.get("color", "#4CAF50"))
+                if b.get("slots"):
+                    db.replace_slots(cid, b["slots"])
             return _send_json(self, {"id": cid})
 
         # 创建/获取某次课堂记录（按 课程+日期 去重）
@@ -337,7 +465,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return _send_json(self, {"error": "不支持的课程语言"}, status=400)
             if "vocabulary" in b and (not isinstance(b["vocabulary"], str) or len(b["vocabulary"]) > 800):
                 return _send_json(self, {"error": "课程术语请限制在 800 字以内"}, status=400)
-            db.update_course(m.group(1), **b)
+            cid = m.group(1)
+            if not db.get_course(cid):
+                return _send_json(self, {"error": "课程不存在。"}, status=404)
+            try:
+                if "slots" in b:
+                    schedule.validate_slots(b["slots"])
+                with db.write_txn():
+                    db.update_course(cid, **b)
+                    if "slots" in b:
+                        db.replace_slots(cid, b["slots"])
+            except ValueError as exc:
+                return _send_json(self, {"error": str(exc)}, status=400)
             return _send_json(self, {"ok": True})
         if m and method == "DELETE":
             self._delete_course(m.group(1))
@@ -349,7 +488,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             return _send_json(self, {"ok": True})
         m = re.match(r"/api/courses/([\w-]+)/sessions$", p)
         if m and method == "GET":
-            return _send_json(self, {"sessions": db.list_sessions(m.group(1))})
+            course = db.get_course(m.group(1))
+            semester = db.get_semester(course["semester_id"]) if course else None
+            return _send_json(self, {"sessions": [schedule.session_with_week(s, semester)
+                                                  for s in db.list_sessions(m.group(1))]})
 
         # 本周
         m = re.match(r"/api/week$", p)
@@ -369,7 +511,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return _send_json(self, {"week": [], "semester": None})
             courses = db.list_courses(semester_id=sem["id"])
             plan = schedule.build_week_plan(sem, courses, center_d)
-            return _send_json(self, {"week": plan, "semester": sem, "center": center_d.isoformat()})
+            today = date.today().isoformat()
+            anchor = schedule.week_anchor(sem)
+            return _send_json(self, {"week": plan, "semester": sem, "center": center_d.isoformat(),
+                                     "teaching": {"number": schedule.week_number(anchor, center_d.isoformat()),
+                                                  "today": today, "today_number": schedule.week_number(anchor, today),
+                                                  "first": schedule.week_number(anchor, sem["start_date"]),
+                                                  "last": schedule.week_number(anchor, sem["end_date"])}})
 
         # 课堂详情
         m = re.match(r"/api/sessions/([\w-]+)/notes/chapters/(\d+)$", p)
@@ -404,10 +552,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         # 该课堂最新任务（用于进度展示）
         m = re.match(r"/api/sessions/([\w-]+)/job$", p)
         if m and method == "GET":
-            job = db.read_conn().execute(
-                "SELECT * FROM processing_jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
-                (m.group(1),)).fetchone()
-            return _send_json(self, {"job": dict(job) if job else None})
+            sid = m.group(1)
+            audio = db.read_conn().execute("SELECT audio_hash FROM class_sessions WHERE id=?", (sid,)).fetchone()
+            return _send_json(self, {"job": _public_job(_latest_job(sid)), "audio_version": audio[0] if audio else None})
 
         # 上传录音（裸字节）
         m = re.match(r"/api/sessions/([\w-]+)/audio(?:/(\d+))?$", p)
@@ -430,6 +577,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             b = _read_json(self)
             mode = (b.get("mode") or "transcribe").lower()
+            if mode == 'resume':
+                resume = jobs.resume_details(db.get_session(m.group(1)), _latest_job(m.group(1)))
+                if not resume:
+                    return _send_json(self, {'error': '没有可继续的未完成任务'}, status=409)
+                mode = resume['mode']
             need_whisper = ("transcrib" in mode) or ("full" in mode)
             need_llm = ("analy" in mode) or ("full" in mode) or mode in {"transcribe", "retranscribe"}
             if not need_whisper and not need_llm:  # 未知模式，保守要求两者
@@ -456,9 +608,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             return _send_json(self, {"job_id": job_id})
 
         # 任务
+        if p == '/api/jobs' and method == 'GET':
+            rows = db.read_conn().execute(
+                'SELECT j.*, COALESCE(s.title,c.name) AS session_title,c.name AS course_name '
+                'FROM processing_jobs j JOIN class_sessions s ON s.id=j.session_id '
+                'JOIN courses c ON c.id=s.course_id ORDER BY j.created_at DESC,j.rowid DESC LIMIT 20'
+            ).fetchall()
+            return _send_json(self, {'jobs': [_public_job(row) for row in rows]})
         m = re.match(r"/api/jobs/([\w-]+)$", p)
         if m and method == "GET":
-            return _send_json(self, {"job": db.get_job(m.group(1)) or {}})
+            return _send_json(self, {"job": _public_job(db.get_job(m.group(1))) or {}})
         m = re.match(r"/api/jobs/([\w-]+)/cancel$", p)
         if m and method == "POST":
             job = db.get_job(m.group(1))
@@ -476,10 +635,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._search()
 
         # 设置
+        if p == "/api/audio-storage" and method == "GET":
+            return _send_json(self, audio_archive.status())
+        if (p, method) in {("/api/audio-storage", "PUT"), ("/api/audio-storage/compress", "POST")}:
+            try:
+                body = self._settings_body()
+                result = audio_archive.set_retention(body.get("text_only")) if method == "PUT" else audio_archive.request_batch()
+                return _send_json(self, result)
+            except ValueError as error:
+                return _send_json(self, {"error": str(error)}, status=400)
         if p == "/api/settings" and method == "GET":
             return self._settings_get()
         if p == "/api/settings" and method == "PUT":
             return self._settings_put()
+        if p == "/api/settings/test-translation" and method == "POST":
+            return self._test_translation()
 
         # 测试 whisper / analysis
         if p == "/api/settings/test-whisper" and method == "POST":
@@ -550,7 +720,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         m = re.match(r"/api/items/([\w-]+)$", p)
         if m and method == "PUT":
             b = _read_json(self)
-            db.update_item(m.group(1), **b)
+            try:
+                db.update_item(m.group(1), **b)
+            except KeyError:
+                return _send_json(self, {"error": "这条事项已更新或移除，请刷新列表。"}, status=404)
             return _send_json(self, {"ok": True})
         if m and method == "DELETE":
             db.delete_item(m.group(1))
@@ -619,8 +792,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not sess:
             return _send_json(self, {"error": "不存在"}, status=404)
         course = db.get_course(sess["course_id"]) or {}
+        if course:
+            sess = schedule.session_with_week(sess, db.get_semester(course["semester_id"]))
         audio_files = [
-            {k: f.get(k) for k in ("index", "name", "bytes", "duration")}
+            {k: f.get(k) for k in ("index", "name", "bytes", "duration", "hash")}
             for f in db.audio_files_for_session(sess)
         ]
         segments = db.list_segments(sid)
@@ -636,13 +811,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         })
 
     def _upload_audio(self, sid):
-        if db.active_jobs():
-            return _send_json(self, {"error": "有课堂正在处理，请完成或取消后再上传。"}, status=409)
+        defer_processing = (self.headers.get("X-Defer-Processing", "") or "").lower() in {"1", "true", "yes"}
+        active = db.active_jobs()
+        if any(job.get('session_id') == sid for job in active) or (active and not defer_processing):
+            return _send_json(self, {"error": "这节课正在处理，或有其他处理任务；可为其他课堂选择先保存、稍后处理。"}, status=409)
         sess = db.get_session(sid)
         if not sess:
             return _send_json(self, {"error": "不存在"}, status=404)
 
-        defer_processing = (self.headers.get("X-Defer-Processing", "") or "").lower() in {"1", "true", "yes"}
+        original_files = db.audio_files_for_session(sess)
 
         batch_header = (self.headers.get("X-Batch-Upload", "") or "").lower()
         is_batch = batch_header in {"1", "true", "yes"}
@@ -742,37 +919,43 @@ class ApiHandler(BaseHTTPRequestHandler):
         dur = hashutil.audio_duration_seconds(dest)
         entry = {"path": dest, "name": filename, "bytes": written,
                  "duration": dur, "hash": fhash}
-        if is_batch:
-            # current_files contains the original recordings plus the files
-            # already uploaded in this batch. Never discard the originals when
-            # a user adds more recordings to an existing lesson.
-            entries = current_files + [entry]
-            duration_values = [e.get("duration") for e in entries]
-            total_duration = (sum(float(v) for v in duration_values)
-                              if all(v is not None for v in duration_values) else None)
-            collection_hash = _audio_collection_hash(entries)
-            # 首段开始一个新的批次，但保留课堂已有的录音文件，避免意外删除。
-            if batch_index == 0:
+        with db.write_txn():
+            active = db.active_jobs()
+            if any(job.get('session_id') == sid for job in active) or (active and not defer_processing):
+                raise recording_drafts.DraftError('处理状态已变化，录音未加入课堂，请稍后重试', 409)
+            if [entry['path'] for entry in db.audio_files_for_session(sid)] != [entry['path'] for entry in original_files]:
+                raise recording_drafts.DraftError('录音列表已更新，请刷新后重试', 409)
+            if is_batch:
+                # current_files contains the original recordings plus the files
+                # already uploaded in this batch. Never discard the originals when
+                # a user adds more recordings to an existing lesson.
+                entries = current_files + [entry]
+                duration_values = [e.get("duration") for e in entries]
+                total_duration = (sum(float(v) for v in duration_values)
+                                  if all(v is not None for v in duration_values) else None)
+                collection_hash = _audio_collection_hash(entries)
+                # 首段开始一个新的批次，但保留课堂已有的录音文件，避免意外删除。
+                if batch_index == 0:
+                    db.snapshot_session(sid, "上传新录音前")
+                db.update_session(
+                    sid, audio_path=entries[0]["path"], audio_hash=collection_hash,
+                    audio_duration_seconds=total_duration, audio_manifest=json.dumps(
+                        entries, ensure_ascii=False),
+                    status="ready_to_process" if defer_processing else "waiting_model", source_type="audio",
+                )
+            else:
+                # 重复检测
+                entries = [entry]
+                total_duration = dur
+                collection_hash = fhash
+                dup = db.read_conn().execute(
+                    "SELECT id, course_id, session_date FROM class_sessions WHERE audio_hash=? AND id!=?",
+                    (fhash, sid)).fetchone()
                 db.snapshot_session(sid, "上传新录音前")
-            db.update_session(
-                sid, audio_path=entries[0]["path"], audio_hash=collection_hash,
-                audio_duration_seconds=total_duration, audio_manifest=json.dumps(
-                    entries, ensure_ascii=False),
-                status="ready_to_process" if defer_processing else "waiting_model", source_type="audio",
-            )
-        else:
-            # 重复检测
-            entries = [entry]
-            total_duration = dur
-            collection_hash = fhash
-            dup = db.read_conn().execute(
-                "SELECT id, course_id, session_date FROM class_sessions WHERE audio_hash=? AND id!=?",
-                (fhash, sid)).fetchone()
-            db.snapshot_session(sid, "上传新录音前")
-            db.update_session(sid, audio_path=dest, audio_hash=fhash,
-                              audio_duration_seconds=dur, audio_manifest=None,
-                              status="ready_to_process" if defer_processing else "waiting_model",
-                              source_type="audio")
+                db.update_session(sid, audio_path=dest, audio_hash=fhash,
+                                  audio_duration_seconds=dur, audio_manifest=None,
+                                  status="ready_to_process" if defer_processing else "waiting_model",
+                                  source_type="audio")
 
         # 批量模式只在最后一个文件到达后启动一次流水线。
         if is_batch and batch_index < batch_count - 1:
@@ -877,17 +1060,17 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _settings_get(self):
         s = db.get_all_settings()
-        # 将旧版本保存的 fast/balanced/accurate 档位迁移为唯一受支持的 Qwen 语音模型。
-        # 这样设置页、数据库和实际处理链路不会再出现“显示一个、运行另一个”的情况。
-        if s.get("whisper_tier") != manifest.DEFAULT_WHISPER_TIER:
-            s["whisper_tier"] = manifest.DEFAULT_WHISPER_TIER
-            db.set_setting("whisper_tier", manifest.DEFAULT_WHISPER_TIER)
-        default_llm_id = manifest.default_llm_model()["id"]
-        if s.get("llm_model_id") != default_llm_id:
-            s["llm_model_id"] = default_llm_id
-            db.set_setting("llm_model_id", default_llm_id)
-        # 不返回明文密钥
+        s["whisper_tier"] = manifest.DEFAULT_WHISPER_TIER
+        if not manifest.llm_model_by_id(s.get("llm_model_id")):
+            s["llm_model_id"] = manifest.default_llm_model()["id"]
         s.pop("openai_api_key", None)
+        s.pop("translation_api_key", None)
+        if s.get("openai_base_url"):
+            try:
+                s["openai_base_url"] = llm_provider.normalize_api_endpoint(s["openai_base_url"])
+            except ValueError:
+                s.pop("openai_base_url")
+        s.update(translation_provider.public_settings(s))
         return _send_json(self, {
             "settings": s,
             "whisper_tiers": manifest.WHISPER_TIERS,
@@ -904,33 +1087,68 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  "used_cuda": None, "reason": "处理时检测"},
         })
 
+    def _settings_body(self):
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError("设置请求须使用 JSON。")
+        origin = self.headers.get("Origin")
+        if (self.headers.get("Sec-Fetch-Site") == "cross-site" or
+                (origin and (origin != "http://" + self.headers.get("Host", "")
+                             or urlsplit(origin).hostname not in {"localhost", "127.0.0.1", "::1"}))):
+            raise ValueError("请在课堂助手的设置页执行此操作。")
+        try:
+            if not 0 <= int(self.headers.get("Content-Length", "0")) <= 32 * 1024:
+                raise ValueError()
+            body = _read_json(self)
+            if not isinstance(body, dict):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise ValueError("设置内容无效。") from None
+        return body
+
     def _settings_put(self):
-        b = _read_json(self)
-        allowed = {
-            "ai_provider", "llm_model_id", "whisper_device", "ollama_model",
-            "openai_base_url", "openai_model", "openai_api_key",
-        }
-        for k, v in b.items():
-            if k not in allowed:
-                continue
-            if k == "openai_api_key":
-                if v:
-                    from .credential import set_credential
-                    set_credential("openai_api_key", v)
-                else:
-                    from .credential import delete_credential
-                    delete_credential("openai_api_key")
-                db.set_setting("openai_api_key_set", "1" if v else "0")
-                continue
-            if k == "llm_model_id":
-                # 当前产品只维护一条本地文字整理链路，旧版本选择自动迁移。
-                v = manifest.default_llm_model()["id"]
-            if isinstance(v, bool):
-                db.set_setting(k, "1" if v else "0")
-            elif isinstance(v, (int, float)):
-                db.set_setting(k, str(v))
-            else:
-                db.set_setting(k, v)
+        from . import credential
+        try:
+            b = self._settings_body()
+            allowed = {"ai_provider", "llm_model_id", "whisper_device", "ollama_model"}
+            updates = {k: b[k] for k in allowed.intersection(b)}
+            if "llm_model_id" in updates and not manifest.llm_model_by_id(updates["llm_model_id"]):
+                updates["llm_model_id"] = manifest.default_llm_model()["id"]
+            with translation_provider.SETTINGS_LOCK, ExitStack() as changes:
+                current = db.get_all_settings()
+                updates.update(translation_provider.prepare_update(current, b, changes))
+                if {"openai_base_url", "openai_model", "openai_api_key"}.intersection(b):
+                    # Keep explicitly configured legacy organizers isolated from translation credentials.
+                    base, model, scope = legacy_api_connection({**current, **b})
+                    if "openai_api_key" in b:
+                        value = b["openai_api_key"]
+                        key = translation_provider.validate_key(value, base, model) if value else None
+                        changes.enter_context(credential.credential_change("openai_api_key", key, scope))
+                        updates["openai_api_key_set"] = "1" if key else "0"
+                    else:
+                        try:
+                            previous = legacy_api_connection(current)[2]
+                        except ValueError:
+                            previous = None
+                        if previous != scope and credential.has_credential("openai_api_key", previous, allow_legacy=True):
+                            raise ValueError("更换原有整理 API 的地址或模型时，请重新填写密钥。")
+                    updates.update(openai_base_url=base, openai_model=model)
+                with db.write_txn():
+                    for k, value in updates.items():
+                        db.set_setting(k, value)
+                saved_translation = translation_provider.public_settings({**current, **updates})
+        except ValueError as error:
+            return _send_json(self, {"error": str(error)}, status=400)
+        except OSError:
+            return _send_json(self, {"error": "本机密钥保存失败，请检查 Windows 用户账户和数据目录。"}, status=500)
+        return _send_json(self, {"ok": True, "translation": saved_translation})
+
+    def _test_translation(self):
+        try:
+            translation_provider.test_connection(self._settings_body(), db.get_all_settings())
+        except ValueError as error:
+            return _send_json(self, {"error": str(error)}, status=400)
+        except llm_provider.TranslationAPIError as error:
+            return _send_json(self, {"error": str(error)}, status=502)
         return _send_json(self, {"ok": True})
 
     def _test_whisper(self):
@@ -951,7 +1169,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         """真正发起一次最小推理，避免 available() 存在就误报可用。"""
         provider = None
         try:
-            provider = build_provider(db.get_all_settings())
+            settings = db.get_all_settings()
+            if _read_json(self).get("local_model"):
+                settings["ai_provider"] = "sidecar"
+            provider = build_provider(settings)
             if not provider.available():
                 return _send_json(self, {
                     "ok": False,
@@ -1148,6 +1369,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             res = backup.restore_backup(tmp)
             return _send_json(self, res)
+        except recording_drafts.DraftError as e:
+            return _send_json(self, {"error": str(e)}, status=e.status)
         except Exception as e:  # noqa: BLE001
             return _send_json(self, {"error": str(e)}, status=500)
         finally:
@@ -1156,19 +1379,29 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _delete_course(self, cid):
         # 二次确认由前端负责；这里删除课程及下属课堂（含音频/转写文件）
-        for s in db.list_sessions(cid):
-            self._delete_session_files(s["id"])
-        db.archive_course(cid, True)  # 归档而非硬删，避免误删历史；如需硬删再扩展
+        sessions = db.list_sessions(cid)
+        session_paths = {s['id']: [entry['path'] for entry in db.audio_files_for_session(s)] for s in sessions}
+        with recording_drafts.deleting_audio(session_paths):
+            for s in sessions:
+                self._delete_session_files(s["id"])
+                db.update_session(s['id'], audio_path=None, audio_manifest=None, audio_hash=None,
+                                  audio_duration_seconds=None)
+            db.archive_course(cid, True)  # 归档而非硬删，避免误删历史；如需硬删再扩展
 
     def _delete_session(self, sid):
-        self._delete_session_files(sid)
-        db.delete_session(sid)
+        files = db.audio_files_for_session(sid)
+        with recording_drafts.deleting_audio({sid: [entry['path'] for entry in files]}):
+            self._delete_session_files(sid)
+            db.delete_session(sid)
 
     def _serve_session_audio(self, sid, index=0):
         sess = db.get_session(sid)
         files = db.audio_files_for_session(sess)
         if not files or index < 0 or index >= len(files) or not os.path.exists(files[index]["path"]):
             return _send_text(self, "无录音文件", status=404)
+        version = self._qs_dict().get("v")
+        if version and version != files[index].get("hash"):
+            return _send_text(self, "录音版本已更新", status=409)
         self._serve_file(files[index]["path"])
 
     def _delete_session_audio(self, sid):
@@ -1204,24 +1437,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not managed:
             return _send_json(self, {"error": "这节课的录音路径不在课堂助手内部，不能自动删除；文字结果未更改。"}, status=409)
 
-        failures = []
-        for path in paths:
-            if not os.path.exists(path):
-                continue
-            try:
-                os.remove(path)
-            except OSError as e:
-                failures.append(str(e))
-        if failures or any(os.path.exists(path) for path in paths):
-            LOG.warning("删除课堂录音失败 %s: %s", sid, failures)
-            return _send_json(self, {"error": "部分录音文件无法删除；转写与总结未更改，请关闭占用录音的程序后重试。"}, status=500)
-
-        db.update_session(sid, audio_path=None, audio_manifest=None, audio_hash=None,
-                          audio_duration_seconds=None,
-                          status="completed" if segments else "waiting_upload")
+        with recording_drafts.deleting_audio({sid: list(paths)}):
+            if {entry['path'] for entry in db.audio_files_for_session(sid)} != {entry['path'] for entry in files}:
+                raise recording_drafts.DraftError('录音列表已更新，请刷新后重试', 409)
+            failures = []
+            for path in paths:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    failures.append(str(e))
+            if failures or any(os.path.exists(path) for path in paths):
+                LOG.warning("删除课堂录音失败 %s: %s", sid, failures)
+                raise recording_drafts.DraftError("部分录音文件无法删除；转写与总结未更改，请关闭占用录音的程序后重试。", 500)
+            db.update_session(sid, audio_path=None, audio_manifest=None, audio_hash=None,
+                              audio_duration_seconds=None,
+                              status="completed" if segments else "waiting_upload")
         return _send_json(self, {"ok": True, "transcript_preserved": bool(segments), "audio_removed": True})
 
-    def _delete_staged_audio_file(self, sid, index):
+    def _delete_staged_audio_file(self, sid, index, expected_key=None):
         sess = db.get_session(sid)
         if not sess:
             return _send_json(self, {"error": "课堂记录不存在"}, status=404)
@@ -1246,40 +1481,54 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not managed:
             return _send_json(self, {"error": "录音路径不在课堂助手内部，不能自动删除。"}, status=409)
 
-        if os.path.exists(target["path"]):
-            try:
-                os.remove(target["path"])
-            except OSError:
-                return _send_json(self, {"error": "录音文件暂时无法删除，请关闭占用它的程序后重试。"}, status=500)
-        if os.path.exists(target["path"]):
-            return _send_json(self, {"error": "录音文件仍被占用，请关闭占用它的程序后重试。"}, status=500)
-
-        remaining = [{key: file.get(key) for key in ("path", "name", "bytes", "duration", "hash")}
-                     for file in files if file["index"] != index]
-        durations = [file.get("duration") for file in remaining]
-        total_duration = (sum(float(value) for value in durations)
-                          if durations and all(value is not None for value in durations) else None)
-        db.update_session(
-            sid,
-            audio_path=remaining[0]["path"] if remaining else None,
-            audio_manifest=json.dumps(remaining, ensure_ascii=False) if remaining else None,
-            audio_hash=_audio_collection_hash(remaining) if remaining else None,
-            audio_duration_seconds=total_duration,
-            status="ready_to_process" if remaining else "waiting_upload",
-        )
+        with recording_drafts.deleting_audio({sid: [target['path']]}):
+            from .recording_library import file_info
+            current = db.get_session(sid)
+            current_files = db.audio_files_for_session(current)
+            if (not current or current['status'] != 'ready_to_process' or current_files != files
+                    or (expected_key is not None and file_info(current_files[index])['file_key'] != expected_key)):
+                raise recording_drafts.DraftError('录音列表已更新，请刷新后重试', 409)
+            if os.path.exists(target["path"]):
+                try:
+                    os.remove(target["path"])
+                except OSError:
+                    raise recording_drafts.DraftError("录音文件暂时无法删除，请关闭占用它的程序后重试。", 500)
+            if os.path.exists(target["path"]):
+                raise recording_drafts.DraftError("录音文件仍被占用，请关闭占用它的程序后重试。", 500)
+            remaining = [{key: value for key, value in file.items() if key != "index"}
+                         for file in files if file["index"] != index]
+            durations = [file.get("duration") for file in remaining]
+            total_duration = (sum(float(value) for value in durations)
+                              if durations and all(value is not None for value in durations) else None)
+            db.update_session(
+                sid,
+                audio_path=remaining[0]["path"] if remaining else None,
+                audio_manifest=json.dumps(remaining, ensure_ascii=False) if remaining else None,
+                audio_hash=_audio_collection_hash(remaining) if remaining else None,
+                audio_duration_seconds=total_duration,
+                status="ready_to_process" if remaining else "waiting_upload",
+            )
         return _send_json(self, {
             "ok": True, "deleted_index": index, "file_count": len(remaining),
             "audio_removed": True,
         })
 
     def _serve_file(self, fpath):
+        try:
+            stream = open(fpath, "rb")
+        except FileNotFoundError:
+            return _send_text(self, "文件已更新或移除", status=404)
+        with stream:
+            self._serve_open_file(fpath, stream)
+
+    def _serve_open_file(self, fpath, stream):
         ctype = self._ctype(fpath)
         if fpath.lower().endswith(".webm"):
             ctype = "audio/webm"
         if ctype == "application/octet-stream" and fpath.lower().endswith((".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac")):
             ctype = "audio/" + os.path.splitext(fpath)[1].lower().lstrip(".")
-        size = os.path.getsize(fpath)
-        start, end, status = 0, max(0, size - 1), 200
+        size = os.fstat(stream.fileno()).st_size
+        start, end, status = 0, size - 1, 200
         range_header = self.headers.get("Range", "")
         match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip()) if range_header else None
         if match and size:
@@ -1304,15 +1553,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
-        with open(fpath, "rb") as f:
-            f.seek(start)
-            remaining = length
-            while remaining:
-                chunk = f.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+        stream.seek(start)
+        remaining = length
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            remaining -= len(chunk)
 
     def _delete_session_files(self, sid):
         sess = db.get_session(sid)
@@ -1321,24 +1569,36 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._delete_audio_files(sess)
         tdir = os.path.join(config.get_config().dirs.transcripts, sid)
         if os.path.isdir(tdir):
+            root = os.path.normcase(os.path.realpath(config.get_config().dirs.transcripts))
+            if os.path.commonpath([root, os.path.normcase(os.path.realpath(tdir))]) != root:
+                raise recording_drafts.DraftError('课堂目录不在应用资料目录内，不能自动删除', 409)
             shutil.rmtree(tdir, ignore_errors=True)
 
     def _delete_audio_files(self, sess):
+        audio_root = os.path.normcase(os.path.realpath(config.get_config().dirs.audio))
+
+        def managed(path):
+            try:
+                resolved = os.path.normcase(os.path.realpath(path))
+                return resolved != audio_root and os.path.commonpath([audio_root, resolved]) == audio_root
+            except ValueError:
+                return False
+
         seen = set()
         for f in db.audio_files_for_session(sess):
             path = f.get("path")
-            if path and path not in seen and os.path.exists(path):
+            if path and path not in seen and os.path.exists(path) and managed(path):
                 seen.add(path)
                 try:
                     os.remove(path)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    raise recording_drafts.DraftError('录音文件被占用，未删除课堂，请关闭占用后重试', 500) from exc
         legacy = sess.get("audio_path")
-        if legacy and legacy not in seen and os.path.exists(legacy):
+        if legacy and legacy not in seen and os.path.exists(legacy) and managed(legacy):
             try:
                 os.remove(legacy)
-            except OSError:
-                pass
+            except OSError as exc:
+                raise recording_drafts.DraftError('录音文件被占用，未删除课堂，请关闭占用后重试', 500) from exc
 
     # ---------------- 静态资源 ----------------
     def _serve_static(self, p):
