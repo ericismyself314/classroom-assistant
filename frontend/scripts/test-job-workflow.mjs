@@ -103,7 +103,7 @@ test('global notices catch active transitions and quick tasks between two polls,
   assert.deepEqual(progress.terminalTransitions({ j: 'completed' }, [finished]), []);
 });
 
-test('export includes important items, dates, confirmation status, source and both transcript versions', () => {
+test('export includes important items, dates, source and both transcript versions', () => {
   const text = exporter.sessionExportText({ session: { title: '合成课堂', session_date: '2026-11-13' },
     notes: { knowledge: [{ title: '债券', summary: '利率与价格', points: [{ text: '注意期限' }] }] },
     items: [{ category: 'assignment', title: '报告', details: '三人一组，PDF格式', normalized_date: '2026-11-25',
@@ -112,7 +112,8 @@ test('export includes important items, dates, confirmation status, source and bo
       { category: 'exam', title: '已拒绝误判', verification_status: 'rejected' }],
     segments: [{ start_seconds: 0, display_text: '债券价格', text: 'Bond prices' },
       { start_seconds: 30, display_text: null, text: 'No extra report is required.' }] });
-  for (const word of ['报告', '2026-11-25', '待确认', '三人一组', 'PDF', '1:05', '截止十一月二十五日', 'Bond prices', 'No extra report is required.', '债券价格']) assert.ok(text.includes(word), word);
+  for (const word of ['报告', '2026-11-25', '三人一组', 'PDF', '1:05', '截止十一月二十五日', 'Bond prices', 'No extra report is required.', '债券价格']) assert.ok(text.includes(word), word);
+  assert.ok(!text.includes('待确认'));
   assert.ok(!text.includes('已拒绝误判'));
   assert.ok(!text.includes('展示稿尚未生成'));
 });
