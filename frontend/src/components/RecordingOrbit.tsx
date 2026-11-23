@@ -9,41 +9,54 @@ function makeRenderer(gl: WebGLRenderingContext) {
   const vertex = `
     attribute vec2 uv;
     uniform vec4 shape;
-    uniform vec3 movement;
+    uniform vec2 movement;
     varying vec3 normal, point;
-    varying float angle;
+    varying float angle, bevel;
     void main() {
       float a = uv.x, b = uv.y, k = shape.z, lean = shape.w;
       vec3 axis = vec3(cos(k), sin(k), 0.);
       vec3 side = vec3(-sin(k)*cos(lean), cos(k)*cos(lean), sin(lean));
       vec3 plane = cross(axis,side);
       vec3 radial = cos(a)*axis + sin(a)*side;
-      vec3 p = (shape.x + shape.y*cos(b))*radial + 1.45*sin(b)*plane;
-      vec3 n = normalize(cos(b)*radial/shape.y + sin(b)*plane/1.45);
+      float thickness = .50 + .19*shape.y;
+      vec3 p = (shape.x + shape.y*cos(b))*radial + thickness*sin(b)*plane;
+      vec3 n = normalize(cos(b)*radial/shape.y + sin(b)*plane/thickness);
       float c=cos(movement.x), s=sin(movement.x);
       mat3 yaw=mat3(c,0.,-s,0.,1.,0.,s,0.,c);
       point=yaw*p+vec3(4.,1.,0.);
-      normal=yaw*n; angle=a;
+      normal=yaw*n; angle=a; bevel=cos(b);
       vec2 xy=point.xy*(710./(710.-point.z))-vec2(21.,0.);
       gl_Position=vec4(xy*vec2(1.,-1.)/158.,-point.z/180.,1.);
     }`;
   const fragment = `
     precision highp float;
     varying vec3 normal, point;
-    varying float angle;
-    uniform vec3 tint, movement;
+    varying float angle, bevel;
+    uniform vec3 tint;
+    uniform vec2 movement;
     uniform float voice;
     void main() {
       vec3 n=normalize(normal), eye=normalize(vec3(0.,0.,710.)-point);
-      float front=clamp(dot(n,eye),0.,1.), depth=clamp((point.z+105.)/215.,0.,1.);
-      float key=pow(max(0.,dot(n,normalize(eye+vec3(-.53,-.48,.7)))),12.);
-      float rim=pow(1.-front,2.5);
-      float shine=pow(.5+.5*cos(angle-movement.y),6.);
-      float echo=voice*pow(.5+.5*cos(angle-movement.z),11.);
-      vec3 color=tint*(.32+.46*depth+.16*rim+.24*shine)+
-        vec3(.99,.96,.84)*(.45*key+.11*rim)+
-        mix(tint,vec3(1.,.98,.85),.5)*(.16+.39*shine+.80*echo)*(.35+.65*front);
-      gl_FragColor=vec4(color,1.);
+      float depth=smoothstep(-88.,80.,point.z);
+      // Reflect a fixed studio environment. The broad cards shape the face;
+      // the narrow strip catches the bevel as each hoop turns through the light.
+      vec3 ray=normalize(reflect(-eye,n)+point/240.);
+      float lip=smoothstep(.54,.90,abs(bevel));
+      float sweep=dot(ray,normalize(vec3(-.38,.86,.34)));
+      float card=smoothstep(-.62,-.26,sweep);
+      float darkBand=smoothstep(.00,.19,sweep)*(1.-smoothstep(.29,.55,sweep));
+      float whiteStrip=1.-smoothstep(.025,.16,abs(sweep-.63));
+      float warmCard=smoothstep(.52,.94,dot(ray,normalize(vec3(.71,-.48,.39))));
+      vec3 reflection=mix(vec3(.45,.49,.52),vec3(.87,.91,.94),card);
+      reflection=mix(reflection,vec3(.18,.21,.24),darkBand*.90);
+      reflection=mix(reflection,vec3(.94,.80,.64),warmCard*.66);
+      reflection=mix(reflection,vec3(.99,.99,.98),whiteStrip);
+      vec3 color=reflection*mix(vec3(1.),tint,.24+.54*lip);
+      // Light on the front arc gains a little intensity with the voice.
+      float echo=voice*pow(.5+.5*cos(angle-movement.y),18.);
+      color=mix(color,vec3(1.,.98,.94),.27*echo*(.3+.7*whiteStrip));
+      float opacity=mix(.63,1.,depth);
+      gl_FragColor=vec4(color*opacity,opacity);
     }`;
   for (const [type, source] of [[gl.VERTEX_SHADER, vertex], [gl.FRAGMENT_SHADER, fragment]] as const) {
     const shader = gl.createShader(type);
@@ -72,7 +85,7 @@ function makeRenderer(gl: WebGLRenderingContext) {
   gl.enableVertexAttribArray(uv); gl.vertexAttribPointer(uv,2,gl.FLOAT,false,0,0);
   gl.enable(gl.DEPTH_TEST); gl.clearColor(0,0,0,0);
   const uniforms = ['shape','movement','tint','voice'].map(name => gl.getUniformLocation(program,name));
-  const hoops = [[102,3.15,.56,.82,.69],[91,2.45,.90,.73,.49],[89,2.15,.44,.70,.61],[97,1.7,.80,.83,.69]];
+  const hoops = [[101,4.4,.72,.90,.86],[91,2.9,.99,.85,.67],[82,2.1,.78,.85,.92],[96,1.25,.95,.95,.94]];
   return {
     draw(phase: number, pulse: number, energy: number) {
       gl.viewport(0,0,gl.drawingBufferWidth,gl.drawingBufferHeight);
@@ -83,7 +96,7 @@ function makeRenderer(gl: WebGLRenderingContext) {
       hoops.forEach(([r,w,red,green,blue],i) => {
         const sign = i%2 ? -1 : 1;
         gl.uniform4f(uniforms[0],r,w,tilt[i],lean[i]+sign*.08*energy);
-        gl.uniform3f(uniforms[1],.21*Math.sin(phase-.4),sign*phase-i*.98,sign*pulse+i*.93);
+        gl.uniform2f(uniforms[1],.21*Math.sin(phase-.4),sign*pulse+i*.93);
         gl.uniform3f(uniforms[2],red,green,blue);
         gl.drawElements(gl.TRIANGLES,indices.length,gl.UNSIGNED_SHORT,0);
       });
@@ -131,7 +144,8 @@ export function RecordingOrbit({ stream = null, running = false, idle = false, v
         state.phase += dt * .17;
         state.pulse += dt * .9;
       }
-      const size = Math.round(node.clientWidth*Math.min(window.devicePixelRatio || 1,2));
+      // Supersample the fine bevels on standard-density desktop displays.
+      const size = Math.round(node.clientWidth*Math.min(Math.max(window.devicePixelRatio || 1,1.5),2));
       if (size && node.width !== size) node.width=node.height=size;
       renderer.draw(state.phase,state.pulse,state.level);
       const swell = idle ? .012 * (1 - Math.cos(state.pulse)) : .145 * state.pressure;

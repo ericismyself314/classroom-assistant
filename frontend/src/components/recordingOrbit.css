@@ -12,12 +12,12 @@
 }
 .record-orbit img, .record-orbit canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .record-orbit img {
-  mask-image: radial-gradient(ellipse 58% 65% at 46% 48%, #0005 0%, #0006 44%, #000a 65%, #000e 82%, #000 100%);
+  mask-image: radial-gradient(ellipse 58% 65% at 46% 48%, #0000000c 0%, #00000018 45%, #0000003b 65%, #00000087 82%, #000000bf 100%);
 }
 /* Soft window light on the glass, beneath the moving hoops. */
 .record-orbit::after {
   content: ""; position: absolute; inset: 0; z-index: 1;
-  background: linear-gradient(145deg, #d3e7ddad 4%, #a4cabe38 43%, #abcbb524 72%, #dcca9e75);
+  background: linear-gradient(145deg, #effaf5a6 4%, #e5f4ec24 43%, #eef6ef12 72%, #f4e7ca66);
   mix-blend-mode: screen;
   mask: url("../assets/orbit-glass.webp") center / contain no-repeat;
 }
